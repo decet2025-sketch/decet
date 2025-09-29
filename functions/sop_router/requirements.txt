@@ -1,0 +1,5 @@
+appwrite==4.0.0
+pydantic==2.5.0
+requests==2.31.0
+pyjwt==2.8.0
+email-validator==2.1.0

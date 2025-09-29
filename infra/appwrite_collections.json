@@ -1,0 +1,439 @@
+{
+  "collections": [
+    {
+      "collectionId": "courses",
+      "name": "Courses",
+      "permissions": [
+        "read(\"any\")",
+        "create(\"any\")",
+        "update(\"any\")",
+        "delete(\"any\")"
+      ],
+      "attributes": [
+        {
+          "key": "course_id",
+          "type": "string",
+          "size": 255,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "name",
+          "type": "string",
+          "size": 500,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "certificate_template_html",
+          "type": "string",
+          "size": 100000,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "created_at",
+          "type": "datetime",
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "updated_at",
+          "type": "datetime",
+          "required": true,
+          "array": false
+        }
+      ],
+      "indexes": [
+        {
+          "key": "course_id_unique",
+          "type": "unique",
+          "attributes": ["course_id"]
+        },
+        {
+          "key": "created_at_index",
+          "type": "key",
+          "attributes": ["created_at"]
+        }
+      ]
+    },
+    {
+      "collectionId": "organizations",
+      "name": "Organizations",
+      "permissions": [
+        "read(\"any\")",
+        "create(\"any\")",
+        "update(\"any\")",
+        "delete(\"any\")"
+      ],
+      "attributes": [
+        {
+          "key": "website",
+          "type": "string",
+          "size": 255,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "name",
+          "type": "string",
+          "size": 500,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "sop_email",
+          "type": "string",
+          "size": 255,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "created_at",
+          "type": "datetime",
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "updated_at",
+          "type": "datetime",
+          "required": true,
+          "array": false
+        }
+      ],
+      "indexes": [
+        {
+          "key": "website_unique",
+          "type": "unique",
+          "attributes": ["website"]
+        },
+        {
+          "key": "sop_email_index",
+          "type": "key",
+          "attributes": ["sop_email"]
+        }
+      ]
+    },
+    {
+      "collectionId": "learners",
+      "name": "Learners",
+      "permissions": [
+        "read(\"any\")",
+        "create(\"any\")",
+        "update(\"any\")",
+        "delete(\"any\")"
+      ],
+      "attributes": [
+        {
+          "key": "name",
+          "type": "string",
+          "size": 255,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "email",
+          "type": "string",
+          "size": 255,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "organization_website",
+          "type": "string",
+          "size": 255,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "course_id",
+          "type": "string",
+          "size": 255,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "graphy_enrollment_id",
+          "type": "string",
+          "size": 255,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "enrolled_at",
+          "type": "datetime",
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "completion_at",
+          "type": "datetime",
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "certificate_generated_at",
+          "type": "datetime",
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "certificate_sent_to_sop_at",
+          "type": "datetime",
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "certificate_send_status",
+          "type": "string",
+          "size": 50,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "certificate_file_id",
+          "type": "string",
+          "size": 255,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "last_resend_attempt",
+          "type": "datetime",
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "enrollment_error",
+          "type": "string",
+          "size": 1000,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "status",
+          "type": "string",
+          "size": 50,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "completion_data",
+          "type": "string",
+          "size": 5000,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "completed_at",
+          "type": "datetime",
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "last_completion_check",
+          "type": "datetime",
+          "required": false,
+          "array": false
+        }
+      ],
+      "indexes": [
+        {
+          "key": "course_email_unique",
+          "type": "unique",
+          "attributes": ["course_id", "email"]
+        },
+        {
+          "key": "organization_website_index",
+          "type": "key",
+          "attributes": ["organization_website"]
+        },
+        {
+          "key": "certificate_send_status_index",
+          "type": "key",
+          "attributes": ["certificate_send_status"]
+        },
+        {
+          "key": "email_index",
+          "type": "key",
+          "attributes": ["email"]
+        },
+        {
+          "key": "status_index",
+          "type": "key",
+          "attributes": ["status"]
+        },
+        {
+          "key": "last_completion_check_index",
+          "type": "key",
+          "attributes": ["last_completion_check"]
+        }
+      ]
+    },
+    {
+      "collectionId": "webhook_events",
+      "name": "Webhook Events",
+      "permissions": [
+        "read(\"any\")",
+        "create(\"any\")",
+        "update(\"any\")",
+        "delete(\"any\")"
+      ],
+      "attributes": [
+        {
+          "key": "source",
+          "type": "string",
+          "size": 100,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "payload",
+          "type": "string",
+          "size": 10000,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "course_id",
+          "type": "string",
+          "size": 255,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "email",
+          "type": "string",
+          "size": 255,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "event_id",
+          "type": "string",
+          "size": 255,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "received_at",
+          "type": "datetime",
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "processed_at",
+          "type": "datetime",
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "status",
+          "type": "string",
+          "size": 50,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "attempts",
+          "type": "integer",
+          "required": true,
+          "array": false
+        }
+      ],
+      "indexes": [
+        {
+          "key": "event_id_unique",
+          "type": "unique",
+          "attributes": ["event_id"]
+        },
+        {
+          "key": "status_index",
+          "type": "key",
+          "attributes": ["status"]
+        },
+        {
+          "key": "received_at_index",
+          "type": "key",
+          "attributes": ["received_at"]
+        }
+      ]
+    },
+    {
+      "collectionId": "email_logs",
+      "name": "Email Logs",
+      "permissions": [
+        "read(\"any\")",
+        "create(\"any\")",
+        "update(\"any\")",
+        "delete(\"any\")"
+      ],
+      "attributes": [
+        {
+          "key": "to_email",
+          "type": "string",
+          "size": 255,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "subject",
+          "type": "string",
+          "size": 500,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "attachment_file_id",
+          "type": "string",
+          "size": 255,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "status",
+          "type": "string",
+          "size": 50,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "response",
+          "type": "string",
+          "size": 2000,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "created_at",
+          "type": "datetime",
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "retry_count",
+          "type": "integer",
+          "required": true,
+          "array": false
+        }
+      ],
+      "indexes": [
+        {
+          "key": "to_email_index",
+          "type": "key",
+          "attributes": ["to_email"]
+        },
+        {
+          "key": "status_index",
+          "type": "key",
+          "attributes": ["status"]
+        },
+        {
+          "key": "created_at_index",
+          "type": "key",
+          "attributes": ["created_at"]
+        }
+      ]
+    }
+  ]
+}

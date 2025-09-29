@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements-dev.txt
+        
+    - name: Run tests
+      run: |
+        pytest tests/ -v
+        
+    - name: Build function packages
+      run: |
+        # Build admin_router
+        cd functions/admin_router
+        pip install -r requirements.txt -t .
+        zip -r ../../admin_router.zip . -x "*.pyc" "__pycache__/*" "*.git*"
+        
+        # Build graphy_webhook
+        cd ../graphy_webhook
+        pip install -r requirements.txt -t .
+        zip -r ../../graphy_webhook.zip . -x "*.pyc" "__pycache__/*" "*.git*"
+        
+        # Build certificate_worker
+        cd ../certificate_worker
+        pip install -r requirements.txt -t .
+        zip -r ../../certificate_worker.zip . -x "*.pyc" "__pycache__/*" "*.git*"
+        
+        # Build sop_router
+        cd ../sop_router
+        pip install -r requirements.txt -t .
+        zip -r ../../sop_router.zip . -x "*.pyc" "__pycache__/*" "*.git*"
+        
+    - name: Generate changelog
+      id: changelog
+      run: |
+        # Generate changelog from git tags
+        echo "## What's Changed" > CHANGELOG.md
+        echo "" >> CHANGELOG.md
+        
+        # Get commits since last tag
+        LAST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+        if [ -n "$LAST_TAG" ]; then
+          echo "### Commits since $LAST_TAG" >> CHANGELOG.md
+          git log --pretty=format:"- %s (%h)" $LAST_TAG..HEAD >> CHANGELOG.md
+        else
+          echo "### All commits" >> CHANGELOG.md
+          git log --pretty=format:"- %s (%h)" >> CHANGELOG.md
+        fi
+        
+        echo "" >> CHANGELOG.md
+        echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/$LAST_TAG...${{ github.ref_name }}" >> CHANGELOG.md
+        
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref_name }}
+        release_name: Release ${{ github.ref_name }}
+        body_path: CHANGELOG.md
+        draft: false
+        prerelease: false
+        
+    - name: Upload Release Assets
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./admin_router.zip
+        asset_name: admin_router.zip
+        asset_content_type: application/zip
+        
+    - name: Upload Release Assets
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./graphy_webhook.zip
+        asset_name: graphy_webhook.zip
+        asset_content_type: application/zip
+        
+    - name: Upload Release Assets
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./certificate_worker.zip
+        asset_name: certificate_worker.zip
+        asset_content_type: application/zip
+        
+    - name: Upload Release Assets
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./sop_router.zip
+        asset_name: sop_router.zip
+        asset_content_type: application/zip
