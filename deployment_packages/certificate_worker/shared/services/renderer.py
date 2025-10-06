@@ -10,8 +10,6 @@ from typing import Optional, Dict, Any
 import requests
 from jinja2 import Environment, BaseLoader, select_autoescape
 from jinja2.exceptions import TemplateError
-import pyppeteer
-from pyppeteer import launch
 from bs4 import BeautifulSoup
 
 from ..models import CertificateContext, PDFGenerationRequest, PDFGenerationResponse
@@ -113,14 +111,22 @@ class CertificateRenderer:
             # Create template
             template = self.jinja_env.from_string(sanitized_template)
             
-            # Prepare context data
+            # Prepare context data with both formats (curly braces and underscores)
             context_data = {
+                # Underscore format (Jinja2 style)
                 'learner_name': context.learner_name,
                 'course_name': context.course_name,
                 'completion_date': context.completion_date,
                 'organization': context.organization,
                 'learner_email': context.learner_email,
-                'custom_fields': context.custom_fields or {}
+                'custom_fields': context.custom_fields or {},
+                
+                # Curly brace format (simple replacement)
+                'learnerName': context.learner_name,
+                'courseName': context.course_name,
+                'completionDate': context.completion_date,
+                'organizationName': context.organization,
+                'learnerEmail': context.learner_email
             }
             
             # Add any custom fields to the root context
@@ -129,6 +135,13 @@ class CertificateRenderer:
             
             # Render template
             rendered_html = template.render(**context_data)
+            
+            # Also handle simple curly brace replacement for templates that don't use Jinja2
+            rendered_html = rendered_html.replace('{learnerName}', context.learner_name)
+            rendered_html = rendered_html.replace('{courseName}', context.course_name)
+            rendered_html = rendered_html.replace('{completionDate}', context.completion_date)
+            rendered_html = rendered_html.replace('{organizationName}', context.organization)
+            rendered_html = rendered_html.replace('{learnerEmail}', context.learner_email)
             
             # Post-process to ensure valid HTML
             rendered_html = self._ensure_valid_html(rendered_html)
@@ -188,58 +201,6 @@ class CertificateRenderer:
             logger.error(f"Error ensuring valid HTML: {e}")
             return html
 
-    async def html_to_pdf_pyppeteer(self, html_content: str, filename: str) -> Optional[bytes]:
-        """
-        Convert HTML to PDF using pyppeteer (headless Chromium).
-        """
-        try:
-            # Launch browser
-            browser = await launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--no-first-run',
-                    '--no-zygote',
-                    '--disable-gpu'
-                ]
-            )
-            
-            try:
-                # Create new page
-                page = await browser.newPage()
-                
-                # Set viewport
-                await page.setViewport({'width': 1200, 'height': 800})
-                
-                # Set content
-                await page.setContent(html_content, waitUntil='networkidle0')
-                
-                # Emulate screen media
-                await page.emulateMedia('screen')
-                
-                # Generate PDF
-                pdf_bytes = await page.pdf({
-                    'format': 'A4',
-                    'printBackground': True,
-                    'margin': {
-                        'top': '20mm',
-                        'right': '20mm',
-                        'bottom': '20mm',
-                        'left': '20mm'
-                    }
-                })
-                
-                return pdf_bytes
-                
-            finally:
-                await browser.close()
-                
-        except Exception as e:
-            logger.error(f"Error generating PDF with pyppeteer: {e}")
-            return None
 
     def html_to_pdf_external_api(self, html_content: str, filename: str) -> Optional[bytes]:
         """
@@ -285,30 +246,18 @@ class CertificateRenderer:
 
     def html_to_pdf(self, html_content: str, filename: str) -> PDFGenerationResponse:
         """
-        Convert HTML to PDF with fallback strategy.
+        Convert HTML to PDF using PDFEndpoint API.
         """
         try:
-            # Try pyppeteer first
-            try:
-                pdf_bytes = asyncio.run(self.html_to_pdf_pyppeteer(html_content, filename))
-                if pdf_bytes:
-                    return PDFGenerationResponse(ok=True, file_id="pdf_generated")
-            except Exception as e:
-                logger.warning(f"Pyppeteer PDF generation failed: {e}")
+            logger.info("Generating PDF using PDFEndpoint API")
+            pdf_result = self._generate_pdf_with_pdfendpoint(html_content, filename)
             
-            # Fallback to external API
-            if self.html_to_pdf_api_url:
-                try:
-                    pdf_bytes = self.html_to_pdf_external_api(html_content, filename)
-                    if pdf_bytes:
-                        return PDFGenerationResponse(ok=True, file_id="pdf_generated")
-                except Exception as e:
-                    logger.warning(f"External PDF API failed: {e}")
-            
-            return PDFGenerationResponse(
-                ok=False,
-                error="PDF generation failed with all available methods"
-            )
+            if pdf_result['success']:
+                logger.info(f"PDF generated successfully: {pdf_result['data']['file_size']} bytes")
+                return PDFGenerationResponse(ok=True, file_id="pdf_generated")
+            else:
+                logger.error(f"PDFEndpoint API failed: {pdf_result.get('error', 'Unknown error')}")
+                return PDFGenerationResponse(ok=False, error="PDF generation failed")
             
         except Exception as e:
             logger.error(f"Error in html_to_pdf: {e}")
@@ -317,37 +266,116 @@ class CertificateRenderer:
                 error=f"PDF generation error: {str(e)}"
             )
 
-    def generate_certificate_pdf(
-        self,
-        template_html: str,
-        context: CertificateContext,
-        filename: str
-    ) -> PDFGenerationResponse:
+    def get_pdf_bytes(self, html_content: str, context: CertificateContext) -> Optional[bytes]:
         """
-        Generate certificate PDF from template and context.
+        Generate PDF bytes directly from HTML content using PDFEndpoint API.
         """
         try:
-            # Render HTML
-            rendered_html = self.render_certificate(template_html, context)
+            # Render HTML with context
+            rendered_html = self.render_certificate(html_content, context)
             
-            # Convert to PDF
-            pdf_response = self.html_to_pdf(rendered_html, filename)
+            logger.info("Generating PDF using PDFEndpoint API")
+            pdf_result = self._generate_pdf_with_pdfendpoint(rendered_html, "certificate.pdf")
             
-            return pdf_response
+            if pdf_result['success']:
+                # Download the PDF from the URL
+                pdf_url = pdf_result['data']['url']
+                logger.info(f"Downloading PDF from URL: {pdf_url}")
+                
+                response = requests.get(pdf_url, timeout=30)
+                if response.status_code == 200:
+                    pdf_bytes = response.content
+                    logger.info(f"Downloaded PDF: {len(pdf_bytes)} bytes")
+                    return pdf_bytes
+                else:
+                    logger.error(f"Failed to download PDF: HTTP {response.status_code}")
+                    return None
+            else:
+                logger.error(f"PDFEndpoint API failed: {pdf_result.get('error', 'Unknown error')}")
+                return None
             
         except Exception as e:
-            logger.error(f"Error generating certificate PDF: {e}")
-            return PDFGenerationResponse(
-                ok=False,
-                error=f"Certificate generation failed: {str(e)}"
-            )
+            logger.error(f"Error generating PDF bytes: {e}")
+            return None
 
-    def preview_certificate(self, template_html: str, context: CertificateContext) -> str:
+    def _generate_pdf_with_pdfendpoint(self, html_content: str, filename: str) -> dict:
         """
-        Generate preview HTML for certificate template.
+        Generate PDF using PDFEndpoint API with full CSS support.
+        This is the production method that properly handles CSS styling.
         """
         try:
-            return self.render_certificate(template_html, context)
+            import json
+            
+            logger.info("Starting PDFEndpoint PDF generation")
+            
+            # PDFEndpoint API configuration with multiple keys for fallback
+            api_url = "https://api.pdfendpoint.com/v1/convert"
+            api_tokens = [
+                "pdfe_live_302b2ea1dbb69eda24f127988523a36a0a4d",
+                "pdfe_live_caf821c185031e38be28a9479aff57b22471"
+            ]
+            
+            # Prepare payload
+            payload = {
+                "html": html_content,
+                "margin_top": "1cm",
+                "margin_bottom": "1cm", 
+                "margin_right": "1cm",
+                "margin_left": "1cm",
+                "no_backgrounds": True
+            }
+            
+            logger.info(f"Sending request to PDFEndpoint API: {len(html_content)} characters")
+            
+            # Try each API token until one succeeds
+            last_error = None
+            for i, api_token in enumerate(api_tokens):
+                try:
+                    logger.info(f"Trying API token {i+1}/{len(api_tokens)}")
+                    
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_token}"
+                    }
+                    
+                    # Make API request
+                    response = requests.post(api_url, json=payload, headers=headers, timeout=30)
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        logger.info(f"PDFEndpoint API response: {result}")
+                        
+                        if result.get('success', False):
+                            logger.info(f"PDF generated successfully with token {i+1}: {result['data']['file_size']} bytes")
+                            return {
+                                'success': True,
+                                'data': result['data']
+                            }
+                        else:
+                            logger.warning(f"PDFEndpoint API token {i+1} returned success=false: {result}")
+                            last_error = result.get('error', 'Unknown error')
+                            continue  # Try next token
+                    else:
+                        logger.warning(f"PDFEndpoint API token {i+1} failed with status {response.status_code}: {response.text}")
+                        last_error = f"HTTP {response.status_code}: {response.text}"
+                        continue  # Try next token
+                        
+                except Exception as e:
+                    logger.warning(f"PDFEndpoint API token {i+1} failed with exception: {e}")
+                    last_error = str(e)
+                    continue  # Try next token
+            
+            # All tokens failed
+            logger.error(f"All PDFEndpoint API tokens failed. Last error: {last_error}")
+            return {
+                'success': False,
+                'error': f"All API tokens failed. Last error: {last_error}"
+            }
+                
         except Exception as e:
-            logger.error(f"Error previewing certificate: {e}")
-            return f"<p>Error rendering certificate: {str(e)}</p>"
+            logger.error(f"PDFEndpoint PDF generation error: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+

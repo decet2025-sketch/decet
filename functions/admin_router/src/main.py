@@ -7,7 +7,9 @@ import io
 import json
 import logging
 import os
+import re
 import sys
+import requests
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -19,17 +21,21 @@ sys.path.insert(0, current_dir)
 from shared.models import (
     ActionRequest, ActionType, BaseResponse,
     CreateCoursePayload, EditCoursePayload, DeleteCoursePayload,
-    PreviewCertificatePayload, ListCoursesPayload, ViewLearnersPayload,
-    AddOrganizationPayload, EditOrganizationPayload, DeleteOrganizationPayload,
-    UploadLearnersCSVPayload, UploadLearnersCSVDirectPayload, ResendCertificatePayload, ListWebhooksPayload,
+    PreviewCertificatePayload, ListCoursesPayload, ViewLearnersPayload, ListAllLearnersPayload,
+    AddOrganizationPayload, EditOrganizationPayload, DeleteOrganizationPayload, ListOrganizationsPayload,
+    UploadLearnersCSVPayload, UploadLearnersCSVDirectPayload, ResendCertificatePayload, DownloadCertificatePayload, ListWebhooksPayload,
     RetryWebhookPayload, CSVValidationResult, UploadResult, EnrollmentResult,
-    CertificateContext, LearnerCSVRow
+    CertificateContext, LearnerCSVRow, GraphyEnrollmentRequest,
+    ListActivityLogsPayload, ActivityType, ActivityStatus,
+    LearnerStatisticsPayload, OrganizationStatisticsPayload, CourseStatisticsPayload,
+    LearnerModel
 )
 from shared.services.db import AppwriteClient
 from shared.services.graphy import GraphyService
 from shared.services.email_service_simple import EmailService
 from shared.services.renderer import CertificateRenderer
 from shared.services.auth import AuthService
+from shared.services.activity_log import ActivityLogService
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -71,6 +77,58 @@ class AdminRouter:
         
         # Initialize auth service
         self.auth = AuthService()
+        
+        # Initialize activity log service
+        self.activity_log = ActivityLogService(
+            client=self.db.client,
+            database_id='main'
+        )
+
+        self.certificate_worker_url = f"{endpoint}/functions/certificate_worker/executions"
+        self.certificate_worker_headers = {
+            'Content-Type': 'application/json',
+            'X-Appwrite-Project': project_id,
+            'X-Appwrite-Key': api_key
+        }
+
+    def _parse_course_id_from_url(self, course_url: str) -> Optional[str]:
+        """
+        Parse course ID from Graphy course URL.
+        
+        URL format: https://sharondecet.graphy.com/courses/201-Georgia-Basic-Security-Officer-Course--24-hours-67fbd49f6fdfb6161c8dde74
+        Course ID: 67fbd49f6fdfb6161c8dde74 (last part after the last dash)
+        """
+        if not course_url:
+            return None
+            
+        try:
+            # Extract the last part of the URL path
+            # Split by '/' and get the last segment
+            url_parts = course_url.split('/')
+            if len(url_parts) < 2:
+                return None
+                
+            course_slug = url_parts[-1]
+            
+            # The course ID is the last part after the final dash
+            # Split by '-' and get the last segment
+            slug_parts = course_slug.split('-')
+            if len(slug_parts) < 2:
+                return None
+                
+            course_id = slug_parts[-1]
+            
+            # Validate that it looks like a course ID (alphanumeric, reasonable length)
+            # Updated to accept course IDs with 16+ characters (was 20+)
+            if re.match(r'^[a-f0-9]{16,}$', course_id):
+                return course_id
+            else:
+                logger.warning(f"Extracted course ID '{course_id}' doesn't match expected format (should be 16+ hex characters)")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error parsing course ID from URL '{course_url}': {e}")
+            return None
 
     def _handle_user_creation(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
         """Handle user creation endpoints (CREATE_ADMIN_USER, CREATE_SOP_USER)."""
@@ -142,6 +200,32 @@ class AdminRouter:
             user_id = user_data['$id']
             is_existing = user_data.get('existing', False)
             
+            # If user already exists, validate the password and role
+            if is_existing:
+                # Get the user's actual role from Appwrite
+                actual_role = self.auth.get_user_role(user_id)
+                if actual_role != 'admin':
+                    return {
+                        'ok': False,
+                        'status': 403,
+                        'error': {
+                            'code': 'INVALID_ROLE',
+                            'message': f'User {email} is not an admin user. Cannot login with admin credentials.'
+                        }
+                    }
+                
+                # Validate password for existing user
+                password_valid = self.auth.validate_user_password(email, password)
+                if not password_valid:
+                    return {
+                        'ok': False,
+                        'status': 401,
+                        'error': {
+                            'code': 'INVALID_PASSWORD',
+                            'message': 'Invalid password!'
+                        }
+                    }
+            
             # Generate JWT token
             token = self.auth.create_jwt_token({
                 'user_id': user_id,
@@ -150,7 +234,7 @@ class AdminRouter:
                 'name': name
             })
             
-            message = 'Admin user created successfully' if not is_existing else 'Admin user already exists, returning JWT token'
+            message = 'Admin user created successfully' if not is_existing else 'Admin user login successful'
             
             return {
                 'ok': True,
@@ -178,70 +262,144 @@ class AdminRouter:
             }
 
     def _create_sop_user(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Create an sop user and return JWT token."""
+        """SOP user login - authenticate and return JWT token."""
         try:
             email = payload.get('email')
-            name = payload.get('name')
             password = payload.get('password')
-            organization_website = payload.get('organization_website')
 
-            if not all([email, name, password, organization_website]):
+            if not all([email, password]):
                 return {
                     'ok': False,
                     'status': 400,
                     'error': {
                         'code': 'MISSING_FIELDS',
-                        'message': 'email, name, password, and organization_website are required'
+                        'message': 'email and password are required'
                     }
                 }
 
-            # Create user in Appwrite Users collection
-            user_result = self.auth.create_user_in_appwrite(
-                email=email,
-                password=password,
-                name=name,
-                role='sop',
-                organization_website=organization_website
-            )
-
-            if not user_result['ok']:
+            # Authenticate user using existing auth service
+            try:
+                # Get user by email to verify they exist and get their details
+                from appwrite.services.users import Users
+                from appwrite.id import ID
+                
+                # Get user by email to verify they exist and get their details
+                users = Users(self.db.client)
+                user_list = users.list(search=email)
+                
+                if not user_list['users']:
+                    return {
+                        'ok': False,
+                        'status': 401,
+                        'error': {
+                            'code': 'AUTH_FAILED',
+                            'message': 'Invalid email or password'
+                        }
+                    }
+                
+                user = user_list['users'][0]
+                
+                # Check if user has SOP role
+                actual_role = self.auth.get_user_role(user['$id'])
+                if actual_role != 'sop':
+                    return {
+                        'ok': False,
+                        'status': 403,
+                        'error': {
+                            'code': 'INVALID_ROLE',
+                            'message': f'User {email} is not a SOP user. Cannot login with SOP credentials.'
+                        }
+                    }
+                
+                # Get organization from user preferences
+                user_prefs = user.get('prefs', {})
+                organization_website = user_prefs.get('organization_website')
+                
+                if not organization_website:
+                    return {
+                        'ok': False,
+                        'status': 400,
+                        'error': {
+                            'code': 'NO_ORGANIZATION',
+                            'message': 'User does not have an organization assigned'
+                        }
+                    }
+                
+                # Get organization details
+                organization = self.db.get_organization_by_website(organization_website)
+                if not organization:
+                    return {
+                        'ok': False,
+                        'status': 404,
+                        'error': {
+                            'code': 'ORGANIZATION_NOT_FOUND',
+                            'message': f'Organization with website {organization_website} not found'
+                        }
+                    }
+                
+                # Validate that the user's email matches the organization's sop_email
+                if organization.sop_email != email:
+                    return {
+                        'ok': False,
+                        'status': 403,
+                        'error': {
+                            'code': 'UNAUTHORIZED_SOP',
+                            'message': 'Not authorized to access this organization'
+                        }
+                    }
+                
+                # Validate password for SOP user
+                password_valid = self.auth.validate_user_password(email, password)
+                if not password_valid:
+                    return {
+                        'ok': False,
+                        'status': 401,
+                        'error': {
+                            'code': 'INVALID_PASSWORD',
+                            'message': 'Invalid password for SOP user'
+                        }
+                    }
+                
+                # Generate JWT token
+                token = self.auth.create_jwt_token({
+                    'user_id': user['$id'],
+                    'email': user['email'],
+                    'role': 'sop',
+                    'name': user['name'],
+                    'organization_website': organization_website
+                })
+                
+                return {
+                    'ok': True,
+                    'status': 200,
+                    'data': {
+                        'user_id': user['$id'],
+                        'email': user['email'],
+                        'name': user['name'],
+                        'role': 'sop',
+                        'token': token,
+                        'message': 'SOP user login successful',
+                        'organization': {
+                            'id': organization.id,
+                            'website': organization.website,
+                            'name': organization.name,
+                            'sop_email': organization.sop_email,
+                            'created_at': organization.created_at.isoformat() if organization.created_at else None,
+                            'updated_at': organization.updated_at.isoformat() if organization.updated_at else None
+                        }
+                    }
+                }
+                    
+            except Exception as auth_error:
+                logger.error(f"Authentication error: {auth_error}")
                 return {
                     'ok': False,
-                    'status': 500,
+                    'status': 401,
                     'error': {
-                        'code': 'USER_CREATION_FAILED',
-                        'message': user_result.get('error', 'Failed to create user')
+                        'code': 'AUTH_FAILED',
+                        'message': 'Invalid email or password'
                     }
                 }
-
-            user_data = user_result['data']
-            user_id = user_data['$id']
-            is_existing = user_data.get('existing', False)
-
-            # Generate JWT token
-            token = self.auth.create_jwt_token({
-                'user_id': user_id,
-                'email': email,
-                'role': 'sop',
-                'name': name,
-                'organization_website': organization_website
-            })
-
-            message = 'sop user created successfully' if not is_existing else 'sop user already exists, returning JWT token'
-
-            return {
-                'ok': True,
-                'status': 201 if not is_existing else 200,
-                'data': {
-                    'user_id': user_id,
-                    'email': email,
-                    'name': name,
-                    'role': 'sop',
-                    'token': token,
-                    'message': message,
-                    'existing': is_existing
-                }
-            }
 
         except Exception as e:
             logger.error(f"Error creating sop user: {e}")
@@ -295,13 +453,19 @@ class AdminRouter:
                 ActionType.PREVIEW_CERTIFICATE: self._handle_preview_certificate,
                 ActionType.LIST_COURSES: self._handle_list_courses,
                 ActionType.VIEW_LEARNERS: self._handle_view_learners,
+                ActionType.LIST_ALL_LEARNERS: self._handle_list_all_learners,
                 ActionType.ADD_ORGANIZATION: self._handle_add_organization,
                 ActionType.EDIT_ORGANIZATION: self._handle_edit_organization,
                 ActionType.DELETE_ORGANIZATION: self._handle_delete_organization,
                 ActionType.LIST_ORGANIZATIONS: self._handle_list_organizations,
                 ActionType.RESEND_CERTIFICATE: self._handle_resend_certificate,
+                ActionType.DOWNLOAD_CERTIFICATE: self._handle_download_certificate,
                 ActionType.LIST_WEBHOOKS: self._handle_list_webhooks,
                 ActionType.RETRY_WEBHOOK: self._handle_retry_webhook,
+                ActionType.LIST_ACTIVITY_LOGS: self._handle_list_activity_logs,
+                ActionType.LEARNER_STATISTICS: self._handle_learner_statistics,
+                ActionType.ORGANIZATION_STATISTICS: self._handle_organization_statistics,
+                ActionType.COURSE_STATISTICS: self._handle_course_statistics,
             }
             
             handler = handler_map.get(action_request.action)
@@ -320,7 +484,9 @@ class AdminRouter:
             return handler(action_request.payload, auth_context)
             
         except Exception as e:
+            import traceback
             logger.error(f"Error handling admin request: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return {
                 'ok': False,
                 'status': 500,
@@ -336,23 +502,41 @@ class AdminRouter:
             # Validate payload
             course_data = CreateCoursePayload(**payload)
             
+            # Parse course ID from URL if course_url is provided and course_id is not
+            final_course_id = course_data.course_id
+            if course_data.course_url and not course_data.course_id:
+                parsed_course_id = self._parse_course_id_from_url(course_data.course_url)
+                if parsed_course_id:
+                    final_course_id = parsed_course_id
+                    logger.info(f"Parsed course ID '{parsed_course_id}' from URL: {course_data.course_url}")
+                else:
+                    return {
+                        'ok': False,
+                        'status': 400,
+                        'error': {
+                            'code': 'INVALID_COURSE_URL',
+                            'message': 'Could not parse course ID from the provided URL'
+                        }
+                    }
+            
             # Check if course already exists
-            existing_course = self.db.get_course_by_course_id(course_data.course_id)
+            existing_course = self.db.get_course_by_course_id(final_course_id)
             if existing_course:
                 return {
                     'ok': False,
                     'status': 409,
                     'error': {
                         'code': 'COURSE_EXISTS',
-                        'message': f'Course with ID {course_data.course_id} already exists'
+                        'message': f'Course with ID {final_course_id} already exists'
                     }
                 }
             
             # Create course
             course = self.db.create_course({
-                'course_id': course_data.course_id,
+                'course_id': final_course_id,
                 'name': course_data.name,
-                'certificate_template_html': course_data.certificate_template_html
+                'certificate_template_html': course_data.certificate_template_html,
+                'course_url': course_data.course_url
             })
             
             if not course:
@@ -365,6 +549,21 @@ class AdminRouter:
                     }
                 }
             
+            # Log activity (with error handling to not break main functionality)
+            try:
+                self.activity_log.log_activity(
+                    activity_type=ActivityType.COURSE_CREATED,
+                    actor="Admin User",
+                    actor_email=None,
+                    actor_role=auth_context.role.value,
+                    target=course_data.name,
+                    course_id=final_course_id,
+                    details=f"Course {course_data.name} created and activated",
+                    status=ActivityStatus.SUCCESS
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log course creation activity: {log_error}")
+            
             return {
                 'ok': True,
                 'status': 201,
@@ -375,6 +574,23 @@ class AdminRouter:
             
         except Exception as e:
             logger.error(f"Error creating course: {e}")
+            
+            # Log failed activity (with error handling)
+            try:
+                self.activity_log.log_activity(
+                    activity_type=ActivityType.COURSE_CREATED,
+                    actor="Admin User",
+                    actor_email=None,
+                    actor_role=auth_context.role.value,
+                    target=payload.get('name', 'Unknown Course'),
+                    course_id=payload.get('course_id') or payload.get('course_url', 'unknown'),
+                    details=f"Course creation failed: {str(e)}",
+                    status=ActivityStatus.FAILED,
+                    error_message=str(e)
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log course creation failure activity: {log_error}")
+            
             return {
                 'ok': False,
                 'status': 400,
@@ -527,6 +743,31 @@ class AdminRouter:
             # Process valid rows
             upload_result = self._process_learner_enrollments(validation_result, upload_data.course_id)
             
+            # Log activity (with error handling to not break main functionality)
+            try:
+                self.activity_log.log_activity(
+                    activity_type=ActivityType.BULK_UPLOAD,
+                    actor="Admin User",
+                    actor_email=None,
+                    actor_role=auth_context.role.value,
+                    target=course.name,
+                    course_id=upload_data.course_id,
+                    details=f"{upload_result.created_learners} learners uploaded to {course.name} via CSV file",
+                    status=ActivityStatus.SUCCESS,
+                    metadata={
+                        'total_rows': upload_result.total_rows,
+                        'valid_rows': upload_result.valid_rows,
+                        'invalid_rows': upload_result.invalid_rows,
+                        'duplicate_rows': upload_result.duplicate_rows,
+                        'created_learners': upload_result.created_learners,
+                        'enrollment_success': upload_result.enrollment_success,
+                        'enrollment_failed': upload_result.enrollment_failed,
+                        'csv_file_id': upload_data.csv_file_id
+                    }
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log bulk upload activity: {log_error}")
+            
             return {
                 'ok': True,
                 'status': 200,
@@ -567,6 +808,30 @@ class AdminRouter:
             
             # Process valid rows
             upload_result = self._process_learner_enrollments(validation_result, upload_data.course_id)
+            
+            # Log activity (with error handling to not break main functionality)
+            try:
+                self.activity_log.log_activity(
+                    activity_type=ActivityType.BULK_UPLOAD,
+                    actor="Admin User",
+                    actor_email=None,
+                    actor_role=auth_context.role.value,
+                    target=course.name,
+                    course_id=upload_data.course_id,
+                    details=f"{upload_result.created_learners} learners uploaded to {course.name} via CSV",
+                    status=ActivityStatus.SUCCESS,
+                    metadata={
+                        'total_rows': upload_result.total_rows,
+                        'valid_rows': upload_result.valid_rows,
+                        'invalid_rows': upload_result.invalid_rows,
+                        'duplicate_rows': upload_result.duplicate_rows,
+                        'created_learners': upload_result.created_learners,
+                        'enrollment_success': upload_result.enrollment_success,
+                        'enrollment_failed': upload_result.enrollment_failed
+                    }
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log bulk upload activity: {log_error}")
             
             return {
                 'ok': True,
@@ -792,22 +1057,21 @@ class AdminRouter:
                     created_learners += 1
                     
                     # Enroll in Graphy
-                    enrollment_request = {
-                        'course_id': course_id,
-                        'email': learner_row.email,
-                        'name': learner_row.name,
-                        'metadata': {
+                    enrollment_request = GraphyEnrollmentRequest(
+                        course_id=course_id,
+                        email=learner_row.email,
+                        name=learner_row.name,
+                        metadata={
                             'organization_website': learner_row.organization_website
                         }
-                    }
+                    )
                     
                     enrollment_response = self.graphy.enroll_learner(enrollment_request)
                     
                     if enrollment_response.ok:
                         # Update learner with enrollment details
                         self.db.update_learner(learner.id, {
-                            'graphy_enrollment_id': enrollment_response.enrollment_id,
-                            'enrolled_at': datetime.utcnow().isoformat() + 'Z'
+                            'enrollment_status': 'enrolled'
                         })
                         enrollment_success += 1
                     else:
@@ -911,13 +1175,19 @@ class AdminRouter:
             list_data = ListCoursesPayload(**payload)
             
             # Get courses
-            courses = self.db.list_courses(list_data.limit, list_data.offset)
+            courses, total_count = self.db.list_courses(list_data.limit, list_data.offset, list_data.search)
             
             return {
                 'ok': True,
                 'status': 200,
                 'data': {
                     'courses': [json.loads(course.json()) for course in courses]
+                },
+                'pagination': {
+                    'total': total_count,
+                    'limit': list_data.limit,
+                    'offset': list_data.offset,
+                    'has_more': (list_data.offset + len(courses)) < total_count
                 }
             }
             
@@ -972,6 +1242,203 @@ class AdminRouter:
                 }
             }
 
+    def _handle_list_all_learners(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+        """Handle LIST_ALL_LEARNERS action with grouped response."""
+        try:
+            # Validate payload
+            list_data = ListAllLearnersPayload(**payload)
+            
+            # Get all learners (we'll group them by email)
+            all_learners = []
+            
+            if list_data.organization_website and list_data.course_id:
+                # Both filters
+                learners = self.db.query_learners_for_org(
+                    list_data.organization_website, 
+                    list_data.limit * 10,  # Get more to account for grouping
+                    list_data.offset,
+                    list_data.search
+                )
+                learners = [l for l in learners if l.course_id == list_data.course_id]
+                all_learners = learners
+            elif list_data.organization_website:
+                # Filter by organization only
+                all_learners = self.db.query_learners_for_org(
+                    list_data.organization_website, 
+                    list_data.limit * 10,  # Get more to account for grouping
+                    list_data.offset,
+                    list_data.search
+                )
+            elif list_data.course_id:
+                # Filter by course only
+                all_learners = self.db.query_learners_for_course(
+                    list_data.course_id, 
+                    list_data.limit * 10,  # Get more to account for grouping
+                    list_data.offset,
+                    list_data.search
+                )
+            else:
+                # No filters - get all learners from database
+                # This ensures we get both learners with valid organizations and learners without valid organizations
+                all_learners = []
+                
+                try:
+                    from appwrite.query import Query
+                    queries = [
+                        Query.limit(1000),
+                        Query.offset(0)
+                    ]
+                    
+                    # Add search filter if provided
+                    if list_data.search:
+                        queries.append(Query.contains('name', list_data.search))
+                    
+                    result = self.db.databases.list_documents(
+                        database_id='main',
+                        collection_id='learners',
+                        queries=queries
+                    )
+                    
+                    for doc in result['documents']:
+                        learner = self.db._convert_document_to_model(doc, LearnerModel)
+                        if learner:
+                            # Additional client-side filtering for email search
+                            if list_data.search and list_data.search.lower() not in learner.name.lower() and list_data.search.lower() not in learner.email.lower():
+                                continue
+                            all_learners.append(learner)
+                            
+                    logger.info(f"Found {len(all_learners)} learners from database with search: {list_data.search}")
+                except Exception as e:
+                    logger.error(f"Error getting learners from database: {e}")
+                    all_learners = []
+            
+            # Group learners by email
+            learner_groups = {}
+            for learner in all_learners:
+                email = learner.email
+                if email not in learner_groups:
+                    learner_groups[email] = {
+                        'learner_info': {
+                            'name': learner.name,
+                            'email': learner.email,
+                            'organization_website': learner.organization_website
+                        },
+                        'organization_info': None,  # Will be populated below
+                        'courses': []
+                    }
+                
+                # Get course information
+                course = self.db.get_course_by_course_id(learner.course_id)
+                course_name = course.name if course else f"Course {learner.course_id}"
+                
+                # Add course info
+                completion_date = getattr(learner, 'completion_date', None)
+                created_at = getattr(learner, 'created_at', None)
+                
+                # If completion_date is not null, set completion_percentage to 100
+                completion_percentage = getattr(learner, 'completion_percentage', 0)
+                if completion_date is not None:
+                    completion_percentage = completion_percentage
+                
+                course_info = {
+                    'course_id': learner.course_id,
+                    'course_name': course_name,
+                    'enrollment_status': getattr(learner, 'enrollment_status', 'pending'),
+                    'completion_percentage': completion_percentage,
+                    'completion_date': completion_date.isoformat() if completion_date else None,
+                    'certificate_status': 'Issued' if completion_date else 'Pending' if getattr(learner, 'enrollment_status', 'pending') == 'completed' else 'N/A',
+                    'created_at': created_at.isoformat() if created_at else None
+                }
+                learner_groups[email]['courses'].append(course_info)
+            
+            # Get organization info for each unique organization
+            org_websites = set(group['learner_info']['organization_website'] for group in learner_groups.values() if group['learner_info']['organization_website'])
+            organizations = {}
+            for website in org_websites:
+                org = self.db.get_organization_by_website(website)
+                if org:
+                    organizations[website] = {
+                        'name': org.name,
+                        'website': org.website,
+                        'sop_email': org.sop_email,
+                        'created_at': org.created_at.isoformat() if org.created_at else None
+                    }
+            
+            # Populate organization info and format response
+            grouped_learners = []
+            for email, group in learner_groups.items():
+                org_website = group['learner_info']['organization_website']
+                
+                if org_website and org_website in organizations:
+                    # Organization exists
+                    group['organization_info'] = organizations[org_website]
+                elif org_website:
+                    # Organization website exists but organization not found
+                    group['organization_info'] = {
+                        'name': 'Organization Not Found',
+                        'website': org_website,
+                        'sop_email': None,
+                        'created_at': None
+                    }
+                else:
+                    # No organization website (null/None)
+                    group['organization_info'] = {
+                        'name': 'No Organization',
+                        'website': None,
+                        'sop_email': None,
+                        'created_at': None
+                    }
+                
+                # Sort courses by creation date (handle None values)
+                group['courses'].sort(key=lambda x: x['created_at'] or '1900-01-01T00:00:00', reverse=True)
+                grouped_learners.append(group)
+            
+            # Sort learners by name
+            grouped_learners.sort(key=lambda x: x['learner_info']['name'])
+            
+            # Apply pagination to grouped results
+            start_idx = list_data.offset
+            end_idx = start_idx + list_data.limit
+            paginated_learners = grouped_learners[start_idx:end_idx]
+            
+            # Calculate summary statistics
+            total_learners = len(grouped_learners)
+            active_learners = len([l for l in grouped_learners if any(c['enrollment_status'] in ['enrolled', 'in_progress'] for c in l['courses'])])
+            total_enrollments = sum(len(l['courses']) for l in grouped_learners)
+            completed_courses = sum(len([c for c in l['courses'] if c['enrollment_status'] == 'completed']) for l in grouped_learners)
+            completion_rate = round((completed_courses / total_enrollments * 100) if total_enrollments > 0 else 0, 1)
+            
+            return {
+                'ok': True,
+                'status': 200,
+                'data': {
+                    'learners': paginated_learners,
+                    'summary': {
+                        'total_learners': total_learners,
+                        'active_learners': active_learners,
+                        'total_enrollments': total_enrollments,
+                        'completion_rate': completion_rate
+                    },
+                    'pagination': {
+                        'total': total_learners,
+                        'limit': list_data.limit,
+                        'offset': list_data.offset,
+                        'has_more': end_idx < total_learners
+                    }
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error listing all learners: {e}")
+            return {
+                'ok': False,
+                'status': 400,
+                'error': {
+                    'code': 'VALIDATION_ERROR',
+                    'message': str(e)
+                }
+            }
+
     def _handle_add_organization(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
         """Handle ADD_ORGANIZATION action."""
         try:
@@ -1007,16 +1474,76 @@ class AdminRouter:
                     }
                 }
             
+            # Create SOP user in Appwrite's built-in auth table
+            sop_user_created = False
+            try:
+                sop_user_result = self.auth.create_user_in_appwrite(
+                    email=org_data.sop_email,
+                    password=org_data.sop_password,
+                    name=org_data.name or f"SOP User for {org_data.website}",
+                    role='sop',
+                    organization_website=org_data.website
+                )
+                
+                if sop_user_result:
+                    sop_user_created = True
+                    logger.info(f"SOP user created successfully for organization {org_data.website}")
+                else:
+                    logger.warning(f"Failed to create SOP user for organization {org_data.website}")
+                    
+            except Exception as sop_error:
+                logger.error(f"Error creating SOP user for organization {org_data.website}: {sop_error}")
+                # Don't fail the organization creation if SOP user creation fails
+                # The admin can manually create the SOP user later
+            
+            # Log activity (with error handling to not break main functionality)
+            try:
+                self.activity_log.log_activity(
+                    activity_type=ActivityType.ORGANIZATION_ADDED,
+                    actor="Admin User",
+                    actor_email=None,
+                    actor_role=auth_context.role.value,
+                    target=org_data.name or org_data.website,
+                    organization_website=org_data.website,
+                    details=f"Organization {org_data.name or org_data.website} created with SOP user {org_data.sop_email}",
+                    status=ActivityStatus.SUCCESS,
+                    metadata={
+                        'sop_user_created': sop_user_created,
+                        'sop_email': org_data.sop_email
+                    }
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log organization creation activity: {log_error}")
+            
             return {
                 'ok': True,
                 'status': 201,
                 'data': {
-                    'organization':  json.loads(org.json())
+                    'organization': json.loads(org.json()),
+                    'sop_user_created': sop_user_created,
+                    'message': 'Organization created successfully. SOP user credentials have been set up.' if sop_user_created else 'Organization created successfully. SOP user creation failed - please create manually.'
                 }
             }
             
         except Exception as e:
             logger.error(f"Error adding organization: {e}")
+            
+            # Log failed activity (with error handling)
+            try:
+                self.activity_log.log_activity(
+                    activity_type=ActivityType.ORGANIZATION_ADDED,
+                    actor="Admin User",
+                    actor_email=None,
+                    actor_role=auth_context.role.value,
+                    target=payload.get('name', 'Unknown Organization'),
+                    organization_website=payload.get('website'),
+                    details=f"Organization creation failed: {str(e)}",
+                    status=ActivityStatus.FAILED,
+                    error_message=str(e)
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log organization creation failure activity: {log_error}")
+            
             return {
                 'ok': False,
                 'status': 400,
@@ -1032,27 +1559,32 @@ class AdminRouter:
             # Validate payload
             org_data = EditOrganizationPayload(**payload)
             
-            # Check if organization exists
-            existing_org = self.db.get_organization_by_website(org_data.website)
+            # Check if organization exists by ID
+            existing_org = self.db.get_organization_by_id(org_data.organization_id)
             if not existing_org:
                 return {
                     'ok': False,
                     'status': 404,
                     'error': {
                         'code': 'ORGANIZATION_NOT_FOUND',
-                        'message': f'Organization with website {org_data.website} not found'
+                        'message': f'Organization with ID {org_data.organization_id} not found'
                     }
                 }
             
             # Prepare update data
             update_data = {}
+            old_website = existing_org.website
+            learners_updated = 0
+            
+            if org_data.website is not None:
+                update_data['website'] = org_data.website
             if org_data.name is not None:
                 update_data['name'] = org_data.name
             if org_data.sop_email is not None:
                 update_data['sop_email'] = org_data.sop_email
             
-            # Update organization
-            updated_org = self.db.update_organization(org_data.website, update_data)
+            # Update organization by ID
+            updated_org = self.db.update_organization_by_id(org_data.organization_id, update_data)
             
             if not updated_org:
                 return {
@@ -1064,16 +1596,64 @@ class AdminRouter:
                     }
                 }
             
-            return {
-                'ok': True,
-                'status': 200,
-                'data': {
-                    'organization': json.loads(updated_org.json())
+            # If website was changed, update all learners and SOP user with the old website
+            if org_data.website is not None and org_data.website != old_website:
+                learners_updated = self.db.update_learners_organization_website(old_website, org_data.website)
+                sop_user_updated = self.db.update_sop_user_organization_website(old_website, org_data.website)
+                logger.info(f"Updated {learners_updated} learners and {sop_user_updated} SOP user from {old_website} to {org_data.website}")
+            else:
+                sop_user_updated = 0
+                
+                # Log activity (with error handling to not break main functionality)
+                try:
+                    self.activity_log.log_activity(
+                        activity_type=ActivityType.ORGANIZATION_UPDATED,
+                        actor="Admin User",
+                        actor_email=None,
+                        actor_role=auth_context.role.value,
+                        target=updated_org.name or updated_org.website,
+                        organization_website=updated_org.website,
+                        details=f"Organization {updated_org.name or updated_org.website} updated. {learners_updated} learners and {sop_user_updated} SOP user updated.",
+                        status=ActivityStatus.SUCCESS,
+                        metadata={
+                            'learners_updated': learners_updated,
+                            'sop_user_updated': sop_user_updated,
+                            'old_website': old_website if org_data.website != old_website else None
+                        }
+                    )
+                except Exception as log_error:
+                    logger.warning(f"Failed to log organization update activity: {log_error}")
+                
+                return {
+                    'ok': True,
+                    'status': 200,
+                    'data': {
+                        'organization': json.loads(updated_org.json()),
+                        'learners_updated': learners_updated,
+                        'sop_user_updated': sop_user_updated,
+                        'message': f'Organization updated successfully. {learners_updated} learners and {sop_user_updated} SOP user updated with new website.' if learners_updated > 0 or sop_user_updated > 0 else 'Organization updated successfully.'
+                    }
                 }
-            }
             
         except Exception as e:
             logger.error(f"Error editing organization: {e}")
+            
+            # Log failed activity (with error handling)
+            try:
+                self.activity_log.log_activity(
+                    activity_type=ActivityType.ORGANIZATION_UPDATED,
+                    actor="Admin User",
+                    actor_email=None,
+                    actor_role=auth_context.role.value,
+                    target=payload.get('name', 'Unknown Organization'),
+                    organization_website=payload.get('website'),
+                    details=f"Organization update failed: {str(e)}",
+                    status=ActivityStatus.FAILED,
+                    error_message=str(e)
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log organization update failure activity: {log_error}")
+            
             return {
                 'ok': False,
                 'status': 400,
@@ -1114,6 +1694,24 @@ class AdminRouter:
                     }
                 }
             
+            # Log activity (with error handling to not break main functionality)
+            try:
+                self.activity_log.log_activity(
+                    activity_type=ActivityType.ORGANIZATION_DELETED,
+                    actor="Admin User",
+                    actor_email=None,
+                    actor_role=auth_context.role.value,
+                    target=existing_org.name or existing_org.website,
+                    organization_website=existing_org.website,
+                    details=f"Organization {existing_org.name or existing_org.website} deleted",
+                    status=ActivityStatus.SUCCESS,
+                    metadata={
+                        'sop_email': existing_org.sop_email
+                    }
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log organization deletion activity: {log_error}")
+            
             return {
                 'ok': True,
                 'status': 200,
@@ -1124,6 +1722,23 @@ class AdminRouter:
             
         except Exception as e:
             logger.error(f"Error deleting organization: {e}")
+            
+            # Log failed activity (with error handling)
+            try:
+                self.activity_log.log_activity(
+                    activity_type=ActivityType.ORGANIZATION_DELETED,
+                    actor="Admin User",
+                    actor_email=None,
+                    actor_role=auth_context.role.value,
+                    target=payload.get('name', 'Unknown Organization'),
+                    organization_website=payload.get('website'),
+                    details=f"Organization deletion failed: {str(e)}",
+                    status=ActivityStatus.FAILED,
+                    error_message=str(e)
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log organization deletion failure activity: {log_error}")
+            
             return {
                 'ok': False,
                 'status': 400,
@@ -1136,18 +1751,11 @@ class AdminRouter:
     def _handle_list_organizations(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
         """Handle LIST_ORGANIZATIONS action."""
         try:
-            # Get pagination parameters
-            limit = payload.get('limit', 100)
-            offset = payload.get('offset', 0)
-            
-            # Validate pagination parameters
-            if not isinstance(limit, int) or limit < 1 or limit > 1000:
-                limit = 100
-            if not isinstance(offset, int) or offset < 0:
-                offset = 0
+            # Validate payload
+            list_data = ListOrganizationsPayload(**payload)
             
             # Get organizations from database
-            organizations = self.db.list_organizations(limit=limit, offset=offset)
+            organizations, total_count = self.db.list_organizations(list_data.limit, list_data.offset, list_data.search)
             
             # Convert to JSON-serializable format
             orgs_data = []
@@ -1159,10 +1767,13 @@ class AdminRouter:
                 'ok': True,
                 'status': 200,
                 'data': {
-                    'organizations': orgs_data,
-                    'count': len(orgs_data),
-                    'limit': limit,
-                    'offset': offset
+                    'organizations': orgs_data
+                },
+                'pagination': {
+                    'total': total_count,
+                    'limit': list_data.limit,
+                    'offset': list_data.offset,
+                    'has_more': (list_data.offset + len(orgs_data)) < total_count
                 }
             }
             
@@ -1178,56 +1789,190 @@ class AdminRouter:
             }
 
     def _handle_resend_certificate(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
-        """Handle RESEND_CERTIFICATE action."""
+        """Handle RESEND_CERTIFICATE action (SOP-initiated)."""
         try:
             # Validate payload
             resend_data = ResendCertificatePayload(**payload)
-            
-            # Find learners to resend certificates for
-            learners = []
-            if resend_data.learner_email:
-                # Find specific learner
-                if resend_data.course_id:
-                    learner = self.db.get_learner_by_course_and_email(resend_data.course_id, resend_data.learner_email)
-                    if learner:
-                        learners = [learner]
-                else:
-                    # Find learner across all courses
-                    # This would require a more complex query
-                    pass
-            elif resend_data.organization_website:
-                # Find all learners for organization
-                learners = self.db.query_learners_for_org(resend_data.organization_website)
-            
-            if not learners:
+
+            # Get learner
+            learner = None
+            if resend_data.learner_email and resend_data.course_id:
+                learner = self.db.get_learner_by_course_and_email(
+                    resend_data.course_id,
+                    str(resend_data.learner_email)
+                )
+
+            else:
                 return {
                     'ok': False,
-                    'status': 404,
+                    'status': 400,
                     'error': {
-                        'code': 'LEARNERS_NOT_FOUND',
-                        'message': 'No learners found matching criteria'
+                        'code': 'INVALID_PAYLOAD',
+                        'message': 'Either learner_email+course_id or organization_website must be provided'
                     }
                 }
-            
-            # Trigger certificate regeneration for each learner
-            resend_count = 0
-            for learner in learners:
-                if learner.completion_at and learner.certificate_send_status in ['sent', 'failed']:
-                    # Update status to trigger resend
-                    self.db.update_learner(learner.id, {
-                        'certificate_send_status': 'pending',
-                        'last_resend_attempt': datetime.utcnow().isoformat() + 'Z'
-                    })
-                    resend_count += 1
-            
-            return {
-                'ok': True,
-                'status': 200,
-                'data': {
-                    'message': f'Certificate resend triggered for {resend_count} learners'
+
+            # Handle single learner resend
+            if learner:
+
+                # Create webhook event for certificate resend
+                webhook_data = {
+                    'event_id': f'resend_{learner.email}_{resend_data.course_id}_{int(datetime.utcnow().timestamp())}',
+                    'learner_email': learner.email,
+                    'course_id': resend_data.course_id,
+                    'completion_date': learner.completion_date.isoformat().replace('+00:00', 'Z') if learner.completion_date else datetime.utcnow().isoformat().replace('+00:00', 'Z'),
+                    'status': 'pending',
+                    'created_at': datetime.utcnow().isoformat().replace('+00:00', 'Z')
                 }
-            }
-            
+
+                webhook_event = self.db.create_webhook_event(webhook_data)
+                if not webhook_event:
+                    return {
+                        'ok': False,
+                        'status': 500,
+                        'error': {
+                            'code': 'WEBHOOK_CREATION_FAILED',
+                            'message': 'Failed to create webhook event for certificate resend'
+                        }
+                    }
+
+                webhook_event_id = webhook_event.id
+                logger.info(f"Created webhook event {webhook_event_id} for certificate resend")
+
+                # Immediately trigger certificate generation
+                logger.info(f"Triggering immediate certificate generation for resend: {learner.email}")
+                cert_result = self.trigger_certificate_generation(webhook_event_id)
+
+                if cert_result.get('ok'):
+                    logger.info(f"Certificate resend triggered successfully for {learner.email}")
+                    # Update learner status
+                    self.db.update_learner(learner.id, {
+                        'certificate_send_status': 'sent',
+                        # 'last_resend_attempt': datetime.utcnow().isoformat() + 'Z'
+                    })
+
+                    return {
+                        'ok': True,
+                        'status': 200,
+                        'data': {
+                            'message': f'Certificate resent successfully for {learner.email}',
+                            'learner_email': learner.email,
+                            'course_id': resend_data.course_id,
+                            'webhook_event_id': webhook_event_id
+                        }
+                    }
+                else:
+                    logger.error(f"Certificate resend failed for {learner.email}: {cert_result.get('error')}")
+                    return {
+                        'ok': False,
+                        'status': 500,
+                        'error': {
+                            'code': 'CERTIFICATE_GENERATION_FAILED',
+                            'message': f'Certificate resend failed: {cert_result.get("error")}'
+                        }
+                    }
+
+            # Handle organization-wide resend
+            elif resend_data.organization_website:
+
+                # Get organization
+                org = self.db.get_organization_by_website(resend_data.organization_website)
+                if not org:
+                    return {
+                        'ok': False,
+                        'status': 404,
+                        'error': {
+                            'code': 'ORGANIZATION_NOT_FOUND',
+                            'message': f'Organization {resend_data.organization_website} not found'
+                        }
+                    }
+
+                # Get learners for organization
+                learners = self.db.query_learners_for_org(resend_data.organization_website)
+                learners_to_resend = [
+                    l for l in learners
+                    if l.completion_at and l.certificate_send_status in ['sent', 'failed']
+                ]
+
+                if not learners_to_resend:
+                    return {
+                        'ok': False,
+                        'status': 404,
+                        'error': {
+                            'code': 'NO_LEARNERS_TO_RESEND',
+                            'message': 'No completed learners found for certificate resend'
+                        }
+                    }
+
+                # Process each learner for certificate resend
+                resend_count = 0
+                successful_resends = 0
+                failed_resends = 0
+
+                for learner in learners_to_resend:
+                    try:
+                        # Create webhook event for certificate resend
+                        webhook_data = {
+                            'event_id': f'resend_{learner.email}_{learner.course_id}_{int(datetime.utcnow().timestamp())}',
+                            'learner_email': learner.email,
+                            'course_id': learner.course_id,
+                            'completion_date': learner.completion_date.isoformat().replace('+00:00', 'Z') if learner.completion_date else datetime.utcnow().isoformat().replace('+00:00', 'Z'),
+                            'status': 'pending',
+                            'created_at': datetime.utcnow().isoformat().replace('+00:00', 'Z')
+                        }
+
+                        webhook_event = self.db.create_webhook_event(webhook_data)
+                        if webhook_event:
+                            webhook_event_id = webhook_event.id
+                            logger.info(f"Created webhook event {webhook_event_id} for certificate resend: {learner.email}")
+
+                            # Immediately trigger certificate generation
+                            cert_result = self.trigger_certificate_generation(webhook_event_id)
+
+                            if cert_result.get('ok'):
+                                logger.info(f"Certificate resend triggered successfully for {learner.email}")
+                                # Update learner status
+                                self.db.update_learner(learner.id, {
+                                    'certificate_send_status': 'sent',
+                                    'last_resend_attempt': datetime.utcnow().isoformat() + 'Z'
+                                })
+                                successful_resends += 1
+                            else:
+                                logger.error(f"Certificate resend failed for {learner.email}: {cert_result.get('error')}")
+                                failed_resends += 1
+                        else:
+                            logger.error(f"Failed to create webhook event for {learner.email}")
+                            failed_resends += 1
+
+                        resend_count += 1
+
+                    except Exception as e:
+                        logger.error(f"Error processing resend for {learner.email}: {e}")
+                        failed_resends += 1
+                        resend_count += 1
+
+                return {
+                    'ok': True,
+                    'status': 200,
+                    'data': {
+                        'message': f'Certificate resend processed for {resend_count} learners: {successful_resends} successful, {failed_resends} failed',
+                        'organization_website': resend_data.organization_website,
+                        'total_processed': resend_count,
+                        'successful_resends': successful_resends,
+                        'failed_resends': failed_resends
+                    }
+                }
+
+            else:
+                return {
+                    'ok': False,
+                    'status': 400,
+                    'error': {
+                        'code': 'INVALID_PAYLOAD',
+                        'message': 'Invalid resend request parameters'
+                    }
+                }
+
         except Exception as e:
             logger.error(f"Error resending certificate: {e}")
             return {
@@ -1237,6 +1982,49 @@ class AdminRouter:
                     'code': 'VALIDATION_ERROR',
                     'message': str(e)
                 }
+            }
+
+
+    def trigger_certificate_generation(self, webhook_event_id: str) -> Dict[str, Any]:
+        """Trigger certificate generation by calling the certificate worker function."""
+        try:
+            logger.info(f"Triggering certificate generation for webhook event: {webhook_event_id}")
+
+            # Prepare the request payload
+            payload = {
+                "body": json.dumps({
+                    "action": "process_webhook",
+                    "webhook_event_id": webhook_event_id
+                })
+            }
+
+            # Call the certificate worker function
+            response = requests.post(
+                self.certificate_worker_url,
+                headers=self.certificate_worker_headers,
+                json=payload,
+                timeout=60  # 60 second timeout for certificate generation
+            )
+
+            if response.status_code in [200, 201]:
+                result = response.json()
+                logger.info(f"Certificate worker response: {result}")
+                return {
+                    'ok': True,
+                    'response': result
+                }
+            else:
+                logger.error(f"Certificate worker failed with status {response.status_code}: {response.text}")
+                return {
+                    'ok': False,
+                    'error': f"HTTP {response.status_code}: {response.text}"
+                }
+
+        except Exception as e:
+            logger.error(f"Error triggering certificate generation: {e}")
+            return {
+                'ok': False,
+                'error': str(e)
             }
 
     def _handle_list_webhooks(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
@@ -1314,6 +2102,285 @@ class AdminRouter:
                 'status': 400,
                 'error': {
                     'code': 'VALIDATION_ERROR',
+                    'message': str(e)
+                }
+            }
+
+    def _handle_download_certificate(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+        """Handle DOWNLOAD_CERTIFICATE action."""
+        try:
+            # Validate payload
+            download_data = DownloadCertificatePayload(**payload)
+            
+            # Get learner
+            learner = self.db.get_learner_by_course_and_email(
+                download_data.course_id,
+                download_data.learner_email
+            )
+            
+            if not learner:
+                return {
+                    'ok': False,
+                    'status': 404,
+                    'error': {
+                        'code': 'LEARNER_NOT_FOUND',
+                        'message': f'Learner {download_data.learner_email} not found for course {download_data.course_id}'
+                    }
+                }
+            
+            # Check if certificate exists
+            if not learner.certificate_file_id:
+                return {
+                    'ok': False,
+                    'status': 404,
+                    'error': {
+                        'code': 'CERTIFICATE_NOT_FOUND',
+                        'message': 'Certificate not yet generated for this learner'
+                    }
+                }
+            
+            # Generate download URL (signed URL for security)
+            certificate_bucket_id = os.getenv('CERTIFICATE_BUCKET_ID', 'certificates')
+            download_url = self.db.get_file_download_url(
+                learner.certificate_file_id,
+                certificate_bucket_id
+            )
+            
+            if not download_url:
+                return {
+                    'ok': False,
+                    'status': 500,
+                    'error': {
+                        'code': 'DOWNLOAD_URL_ERROR',
+                        'message': 'Failed to generate download URL'
+                    }
+                }
+            
+            return {
+                'ok': True,
+                'status': 200,
+                'data': {
+                    'download_url': download_url,
+                    'filename': f"Certificate_{learner.name}_{download_data.course_id}.pdf",
+                    'learner_name': learner.name,
+                    'learner_email': learner.email,
+                    'course_id': download_data.course_id,
+                    'organization_website': learner.organization_website
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error downloading certificate: {e}")
+            return {
+                'ok': False,
+                'status': 400,
+                'error': {
+                    'code': 'VALIDATION_ERROR',
+                    'message': str(e)
+                }
+            }
+
+    def _handle_list_activity_logs(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+        """Handle LIST_ACTIVITY_LOGS action."""
+        try:
+            # Validate payload
+            list_data = ListActivityLogsPayload(**payload)
+            
+            # Get activity logs
+            logs, total_count = self.activity_log.get_activity_logs(
+                limit=list_data.limit,
+                offset=list_data.offset,
+                activity_type=list_data.activity_type,
+                status=list_data.status,
+                organization_website=list_data.organization_website,
+                course_id=list_data.course_id,
+                actor=list_data.actor,
+                start_date=list_data.start_date,
+                end_date=list_data.end_date
+            )
+            
+            return {
+                'ok': True,
+                'status': 200,
+                'data': {
+                    'logs': [json.loads(log.json()) for log in logs]
+                },
+                'pagination': {
+                    'total': total_count,
+                    'limit': list_data.limit,
+                    'offset': list_data.offset,
+                    'has_more': (list_data.offset + len(logs)) < total_count
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error listing activity logs: {e}")
+            return {
+                'ok': False,
+                'status': 400,
+                'error': {
+                    'code': 'VALIDATION_ERROR',
+                    'message': str(e)
+                }
+            }
+
+    def _handle_learner_statistics(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+        """Handle LEARNER_STATISTICS action."""
+        try:
+            # Validate payload
+            stats_data = LearnerStatisticsPayload(**payload)
+            
+            # Get all learners across all organizations
+            organizations = self.db.list_organizations(limit=1000, offset=0)
+            all_learners = []
+            
+            for org in organizations:
+                org_learners = self.db.query_learners_for_org(org.website, limit=10000, offset=0)
+                all_learners.extend(org_learners)
+            
+            # Calculate metrics
+            total_learners = len(set(learner.email for learner in all_learners))  # Unique learners
+            total_enrollments = len(all_learners)  # Total course enrollments
+            
+            # Active learners (currently enrolled or in progress)
+            active_learners = len(set(
+                learner.email for learner in all_learners 
+                if getattr(learner, 'enrollment_status', 'pending') in ['enrolled', 'in_progress']
+            ))
+            
+            # Completion rate (average completion percentage)
+            completion_percentages = [
+                getattr(learner, 'completion_percentage', 0) 
+                for learner in all_learners 
+                if getattr(learner, 'completion_percentage', 0) is not None
+            ]
+            avg_completion_rate = round(
+                sum(completion_percentages) / len(completion_percentages) if completion_percentages else 0, 
+                1
+            )
+            
+            return {
+                'ok': True,
+                'status': 200,
+                'data': {
+                    'total_learners': total_learners,
+                    'active_learners': active_learners,
+                    'total_enrollments': total_enrollments,
+                    'completion_rate': avg_completion_rate
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting learner statistics: {e}")
+            return {
+                'ok': False,
+                'status': 400,
+                'error': {
+                    'code': 'STATISTICS_ERROR',
+                    'message': str(e)
+                }
+            }
+
+    def _handle_organization_statistics(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+        """Handle ORGANIZATION_STATISTICS action."""
+        try:
+            # Validate payload
+            stats_data = OrganizationStatisticsPayload(**payload)
+            
+            # Get all organizations
+            organizations = self.db.list_organizations(limit=1000, offset=0)
+            
+            # Calculate metrics
+            total_organizations = len(organizations)
+            
+            # Active organizations (with websites)
+            active_organizations = len([org for org in organizations if org.website and org.website.strip()])
+            
+            # POC contacts (with POC/SOP emails)
+            poc_contacts = len([org for org in organizations if org.sop_email and org.sop_email.strip()])
+            
+            # Total learners across all organizations
+            total_learners = 0
+            for org in organizations:
+                org_learners = self.db.query_learners_for_org(org.website, limit=10000, offset=0)
+                total_learners += len(org_learners)
+            
+            return {
+                'ok': True,
+                'status': 200,
+                'data': {
+                    'total_organizations': total_organizations,
+                    'active_organizations': active_organizations,
+                    'poc_contacts': poc_contacts,
+                    'total_learners': total_learners
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting organization statistics: {e}")
+            return {
+                'ok': False,
+                'status': 400,
+                'error': {
+                    'code': 'STATISTICS_ERROR',
+                    'message': str(e)
+                }
+            }
+
+    def _handle_course_statistics(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+        """Handle COURSE_STATISTICS action."""
+        try:
+            # Validate payload
+            stats_data = CourseStatisticsPayload(**payload)
+            
+            # Get all courses
+            courses, _ = self.db.list_courses(limit=1000, offset=0)
+            
+            # Calculate metrics
+            total_courses = len(courses)
+            
+            # Total learners across all courses
+            total_learners = 0
+            completion_percentages = []
+            
+            for course in courses:
+                # Get learners for this course
+                course_learners = self.db.query_learners_for_course(course.course_id, limit=10000, offset=0)
+                total_learners += len(course_learners)
+                
+                # Collect completion percentages
+                for learner in course_learners:
+                    completion_pct = getattr(learner, 'completion_percentage', 0)
+                    if completion_pct is not None:
+                        completion_percentages.append(completion_pct)
+            
+            # Average completion rate
+            avg_completion = round(
+                sum(completion_percentages) / len(completion_percentages) if completion_percentages else 0, 
+                1
+            )
+            
+            # Certificate templates (courses with templates)
+            certificate_templates = len([course for course in courses if course.certificate_template_html and course.certificate_template_html.strip()])
+            
+            return {
+                'ok': True,
+                'status': 200,
+                'data': {
+                    'total_courses': total_courses,
+                    'total_learners': total_learners,
+                    'avg_completion': avg_completion,
+                    'certificate_templates': certificate_templates
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting course statistics: {e}")
+            return {
+                'ok': False,
+                'status': 400,
+                'error': {
+                    'code': 'STATISTICS_ERROR',
                     'message': str(e)
                 }
             }

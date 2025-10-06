@@ -12,7 +12,7 @@ rm -rf deployment_packages/
 mkdir -p deployment_packages
 
 # Function names
-FUNCTIONS=("admin_router" "certificate_worker" "graphy_webhook" "sop_router")
+FUNCTIONS=("admin_router" "certificate_worker" "graphy_webhook" "sop_router" "completion_checker")
 
 for func in "${FUNCTIONS[@]}"; do
     echo "📦 Packaging $func..."

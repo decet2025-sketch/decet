@@ -5,7 +5,7 @@ Pydantic models for request/response validation and data structures.
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
-from pydantic import BaseModel, EmailStr, Field, validator
+from pydantic import BaseModel, EmailStr, Field, validator, model_validator
 
 
 class ActionType(str, Enum):
@@ -18,12 +18,19 @@ class ActionType(str, Enum):
     PREVIEW_CERTIFICATE = "PREVIEW_CERTIFICATE"
     LIST_COURSES = "LIST_COURSES"
     VIEW_LEARNERS = "VIEW_LEARNERS"
+    LIST_ALL_LEARNERS = "LIST_ALL_LEARNERS"
     ADD_ORGANIZATION = "ADD_ORGANIZATION"
     EDIT_ORGANIZATION = "EDIT_ORGANIZATION"
     DELETE_ORGANIZATION = "DELETE_ORGANIZATION"
+    LIST_ORGANIZATIONS = "LIST_ORGANIZATIONS"
     RESEND_CERTIFICATE = "RESEND_CERTIFICATE"
     LIST_WEBHOOKS = "LIST_WEBHOOKS"
     RETRY_WEBHOOK = "RETRY_WEBHOOK"
+    LIST_ACTIVITY_LOGS = "LIST_ACTIVITY_LOGS"
+    LEARNER_STATISTICS = "LEARNER_STATISTICS"
+    ORGANIZATION_STATISTICS = "ORGANIZATION_STATISTICS"
+    COURSE_STATISTICS = "COURSE_STATISTICS"
+    DOWNLOAD_CERTIFICATE = "DOWNLOAD_CERTIFICATE"
 
 
 class SOPActionType(str, Enum):
@@ -31,6 +38,8 @@ class SOPActionType(str, Enum):
     LIST_ORG_LEARNERS = "LIST_ORG_LEARNERS"
     DOWNLOAD_CERTIFICATE = "DOWNLOAD_CERTIFICATE"
     RESEND_CERTIFICATE = "RESEND_CERTIFICATE"
+    LIST_ACTIVITY_LOGS = "LIST_ACTIVITY_LOGS"
+    LEARNER_STATISTICS = "LEARNER_STATISTICS"
 
 
 class CertificateSendStatus(str, Enum):
@@ -46,6 +55,34 @@ class WebhookStatus(str, Enum):
     PROCESSING = "processing"
     PROCESSED = "processed"
     FAILED = "failed"
+
+
+class ActivityType(str, Enum):
+    """Activity log types."""
+    COURSE_CREATED = "Course Created"
+    COURSE_UPDATED = "Course Updated"
+    COURSE_DELETED = "Course Deleted"
+    ORGANIZATION_ADDED = "Organization Added"
+    ORGANIZATION_UPDATED = "Organization Updated"
+    ORGANIZATION_DELETED = "Organization Deleted"
+    LEARNER_ENROLLED = "Learner Enrolled"
+    BULK_UPLOAD = "Bulk Upload"
+    CERTIFICATE_GENERATED = "Certificate Generated"
+    CERTIFICATE_SENT = "Certificate Sent"
+    CERTIFICATE_RESENT = "Certificate Resent"
+    WEBHOOK_RECEIVED = "Webhook Received"
+    WEBHOOK_PROCESSED = "Webhook Processed"
+    COMPLETION_CHECKED = "Completion Checked"
+    USER_CREATED = "User Created"
+    USER_LOGIN = "User Login"
+
+
+class ActivityStatus(str, Enum):
+    """Activity status."""
+    SUCCESS = "Success"
+    FAILED = "Failed"
+    PENDING = "Pending"
+    PROCESSING = "Processing"
 
 
 class EmailStatus(str, Enum):
@@ -78,9 +115,17 @@ class ActionRequest(BaseModel):
 # Course Models
 class CreateCoursePayload(BaseModel):
     """Payload for creating a course."""
-    course_id: str = Field(..., min_length=1, max_length=255)
+    course_id: Optional[str] = Field(None, min_length=1, max_length=255)
     name: str = Field(..., min_length=1, max_length=500)
     certificate_template_html: str = Field(..., min_length=1)
+    course_url: Optional[str] = Field(None, max_length=1000)
+    
+    @model_validator(mode='after')
+    def validate_course_id_or_url(self):
+        """Ensure either course_id or course_url is provided."""
+        if not self.course_id and not self.course_url:
+            raise ValueError('Either course_id or course_url must be provided')
+        return self
 
 
 class EditCoursePayload(BaseModel):
@@ -107,6 +152,7 @@ class ListCoursesPayload(BaseModel):
     """Payload for listing courses."""
     limit: int = Field(50, ge=1, le=100)
     offset: int = Field(0, ge=0)
+    search: Optional[str] = Field(None, max_length=255)
 
 
 class ViewLearnersPayload(BaseModel):
@@ -116,19 +162,37 @@ class ViewLearnersPayload(BaseModel):
     offset: int = Field(0, ge=0)
 
 
+class ListAllLearnersPayload(BaseModel):
+    """Payload for listing all learners."""
+    limit: int = Field(50, ge=1, le=100)
+    offset: int = Field(0, ge=0)
+    organization_website: Optional[str] = Field(None, max_length=255)
+    course_id: Optional[str] = Field(None, max_length=255)
+    search: Optional[str] = Field(None, max_length=255)
+
+
 # Organization Models
 class AddOrganizationPayload(BaseModel):
     """Payload for adding an organization."""
     website: str = Field(..., min_length=1, max_length=255)
     name: Optional[str] = Field(None, max_length=500)
     sop_email: EmailStr
+    sop_password: str = Field(..., min_length=6, max_length=100)
 
 
 class EditOrganizationPayload(BaseModel):
     """Payload for editing an organization."""
+    organization_id: str = Field(..., min_length=1, max_length=255)
     website: str = Field(..., min_length=1, max_length=255)
     name: Optional[str] = Field(None, max_length=500)
     sop_email: Optional[EmailStr] = None
+
+
+class ListOrganizationsPayload(BaseModel):
+    """Payload for listing organizations."""
+    limit: int = Field(50, ge=1, le=100)
+    offset: int = Field(0, ge=0)
+    search: Optional[str] = Field(None, max_length=255)
 
 
 class DeleteOrganizationPayload(BaseModel):
@@ -221,6 +285,7 @@ class ListOrgLearnersPayload(BaseModel):
     organization_website: str = Field(..., min_length=1, max_length=255)
     limit: int = Field(50, ge=1, le=100)
     offset: int = Field(0, ge=0)
+    search: Optional[str] = Field(None, max_length=255)
 
 
 class DownloadCertificatePayload(BaseModel):
@@ -236,6 +301,7 @@ class CourseModel(BaseModel):
     course_id: str
     name: str
     certificate_template_html: str
+    course_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -266,32 +332,38 @@ class LearnerModel(BaseModel):
     certificate_file_id: Optional[str] = None
     last_resend_attempt: Optional[datetime] = None
     enrollment_error: Optional[str] = None
+    # Completion tracking fields
+    enrollment_status: Optional[str] = "pending"
+    completion_date: Optional[datetime] = None
+    completion_percentage: Optional[float] = 0.0
+    completion_data: Optional[str] = None
+    last_completion_check: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 class WebhookEventModel(BaseModel):
     """Webhook event database model."""
     id: str
-    source: str
-    payload: str  # JSON string
-    course_id: Optional[str] = None
-    email: Optional[EmailStr] = None
-    event_id: Optional[str] = None
-    received_at: datetime
+    event_id: str
+    course_id: str
+    learner_email: EmailStr
+    completion_date: datetime
+    status: str
+    created_at: datetime
     processed_at: Optional[datetime] = None
-    status: WebhookStatus
-    attempts: int
+    error_message: Optional[str] = None
 
 
 class EmailLogModel(BaseModel):
     """Email log database model."""
     id: str
-    to_email: EmailStr
-    subject: str
-    attachment_file_id: Optional[str] = None
+    learner_email: EmailStr
+    course_id: str
+    organization_website: str
+    sent_at: datetime
+    email_type: str
     status: EmailStatus
-    response: Optional[str] = None
-    created_at: datetime
-    retry_count: int
 
 
 # Service Models
@@ -373,4 +445,60 @@ class JWTPayload(BaseModel):
     role: UserRole
     organization_website: Optional[str] = None
     exp: int
-    iat: int
+
+
+# Activity Log Models
+class ActivityLogModel(BaseModel):
+    """Activity log model."""
+    id: Optional[str] = None
+    activity_type: ActivityType
+    actor: str
+    actor_email: Optional[str] = None
+    actor_role: Optional[str] = None
+    target: Optional[str] = None
+    target_email: Optional[str] = None
+    organization_website: Optional[str] = None
+    course_id: Optional[str] = None
+    details: str
+    status: ActivityStatus
+    error_message: Optional[str] = None
+    metadata: Optional[str] = None
+    timestamp: datetime
+
+
+class ListActivityLogsPayload(BaseModel):
+    """Payload for listing activity logs."""
+    limit: int = Field(50, ge=1, le=100)
+    offset: int = Field(0, ge=0)
+    activity_type: Optional[ActivityType] = None
+    status: Optional[ActivityStatus] = None
+    organization_website: Optional[str] = Field(None, max_length=255)
+    course_id: Optional[str] = Field(None, max_length=255)
+    actor: Optional[str] = Field(None, max_length=255)
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+
+
+class StatisticsPayload(BaseModel):
+    """Base payload for statistics requests."""
+    pass
+
+
+class LearnerStatisticsPayload(StatisticsPayload):
+    """Payload for learner statistics."""
+    pass
+
+
+class OrganizationStatisticsPayload(StatisticsPayload):
+    """Payload for organization statistics."""
+    pass
+
+
+class CourseStatisticsPayload(StatisticsPayload):
+    """Payload for course statistics."""
+    pass
+
+
+class SOPLearnerStatisticsPayload(StatisticsPayload):
+    """Payload for SOP learner statistics."""
+    pass

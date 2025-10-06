@@ -42,6 +42,13 @@
           "type": "datetime",
           "required": true,
           "array": false
+        },
+        {
+          "key": "course_url",
+          "type": "string",
+          "size": 1000,
+          "required": false,
+          "array": false
         }
       ],
       "indexes": [
@@ -432,6 +439,145 @@
           "key": "created_at_index",
           "type": "key",
           "attributes": ["created_at"]
+        }
+      ]
+    },
+    {
+      "collectionId": "activity_logs",
+      "name": "Activity Logs",
+      "permissions": [
+        "read(\"any\")",
+        "create(\"any\")",
+        "update(\"any\")",
+        "delete(\"any\")"
+      ],
+      "attributes": [
+        {
+          "key": "activity_type",
+          "type": "string",
+          "size": 100,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "actor",
+          "type": "string",
+          "size": 255,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "actor_email",
+          "type": "string",
+          "size": 255,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "actor_role",
+          "type": "string",
+          "size": 50,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "target",
+          "type": "string",
+          "size": 255,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "target_email",
+          "type": "string",
+          "size": 255,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "organization_website",
+          "type": "string",
+          "size": 255,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "course_id",
+          "type": "string",
+          "size": 255,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "details",
+          "type": "string",
+          "size": 2000,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "status",
+          "type": "string",
+          "size": 50,
+          "required": true,
+          "array": false
+        },
+        {
+          "key": "error_message",
+          "type": "string",
+          "size": 1000,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "metadata",
+          "type": "string",
+          "size": 5000,
+          "required": false,
+          "array": false
+        },
+        {
+          "key": "timestamp",
+          "type": "datetime",
+          "required": true,
+          "array": false
+        }
+      ],
+      "indexes": [
+        {
+          "key": "activity_type_index",
+          "type": "key",
+          "attributes": ["activity_type"]
+        },
+        {
+          "key": "actor_index",
+          "type": "key",
+          "attributes": ["actor"]
+        },
+        {
+          "key": "organization_website_index",
+          "type": "key",
+          "attributes": ["organization_website"]
+        },
+        {
+          "key": "course_id_index",
+          "type": "key",
+          "attributes": ["course_id"]
+        },
+        {
+          "key": "status_index",
+          "type": "key",
+          "attributes": ["status"]
+        },
+        {
+          "key": "timestamp_index",
+          "type": "key",
+          "attributes": ["timestamp"]
+        },
+        {
+          "key": "actor_role_index",
+          "type": "key",
+          "attributes": ["actor_role"]
         }
       ]
     }

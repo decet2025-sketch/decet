@@ -49,7 +49,7 @@ class AppwriteClient:
         
         # Convert datetime strings to datetime objects
         for key, value in doc.items():
-            if isinstance(value, str) and key.endswith('_at'):
+            if isinstance(value, str) and (key.endswith('_at') or key.endswith('_date')):
                 try:
                     doc[key] = datetime.fromisoformat(value.replace('Z', '+00:00'))
                 except ValueError:
@@ -134,28 +134,83 @@ class AppwriteClient:
             logger.error(f"Error deleting course {course_id}: {e}")
             return False
 
-    def list_courses(self, limit: int = 50, offset: int = 0) -> List[CourseModel]:
-        """List courses with pagination."""
+    def list_courses(self, limit: int = 50, offset: int = 0, search: str = None) -> tuple[List[CourseModel], int]:
+        """List courses with pagination and search."""
         try:
+            # Build filter queries for both count and data queries
+            filter_queries = []
+            if search:
+                # Search in course name using contains (case-insensitive)
+                filter_queries.append(Query.contains('name', search))
+            
+            # Get total count (without limit/offset)
+            count_result = self.databases.list_documents(
+                database_id='main',
+                collection_id='courses',
+                queries=filter_queries
+            )
+            total_count = count_result['total']
+            
+            # Get paginated data
+            data_queries = filter_queries + [
+                Query.limit(limit),
+                Query.offset(offset),
+                Query.order_desc('created_at')
+            ]
+            
             result = self.databases.list_documents(
                 database_id='main',
                 collection_id='courses',
-                queries=[
-                    Query.limit(limit),
-                    Query.offset(offset),
-                    Query.order_desc('created_at')
-                ]
+                queries=data_queries
             )
             
             return [
                 self._convert_document_to_model(doc, CourseModel)
                 for doc in result['documents']
-            ]
+            ], total_count
         except Exception as e:
             logger.error(f"Error listing courses: {e}")
-            return []
+            return [], 0
 
     # Organization operations
+    def list_organizations(self, limit: int = 100, offset: int = 0, search: str = None) -> tuple[List[OrganizationModel], int]:
+        """List all organizations with pagination and search."""
+        try:
+            # Build filter queries for both count and data queries
+            filter_queries = []
+            if search:
+                # Search in organization name using contains (case-insensitive)
+                filter_queries.append(Query.contains('name', search))
+            
+            # Get total count (without limit/offset)
+            count_result = self.databases.list_documents(
+                database_id='main',
+                collection_id='organizations',
+                queries=filter_queries
+            )
+            total_count = count_result['total']
+            
+            # Get paginated data
+            data_queries = filter_queries + [
+                Query.limit(limit),
+                Query.offset(offset),
+                Query.order_asc('name')
+            ]
+            
+            result = self.databases.list_documents(
+                database_id='main',
+                collection_id='organizations',
+                queries=data_queries
+            )
+            
+            return [
+                self._convert_document_to_model(doc, OrganizationModel)
+                for doc in result['documents']
+            ], total_count
+        except Exception as e:
+            logger.error(f"Error listing organizations: {e}")
+            return [], 0
+
     def get_organization_by_website(self, website: str) -> Optional[OrganizationModel]:
         """Get organization by website."""
         try:
@@ -170,6 +225,20 @@ class AppwriteClient:
             return None
         except Exception as e:
             logger.error(f"Error getting organization {website}: {e}")
+            return None
+
+    def get_organization_by_id(self, organization_id: str) -> Optional[OrganizationModel]:
+        """Get organization by ID."""
+        try:
+            result = self.databases.get_document(
+                database_id='main',
+                collection_id='organizations',
+                document_id=organization_id
+            )
+            
+            return self._convert_document_to_model(result, OrganizationModel)
+        except Exception as e:
+            logger.error(f"Error getting organization by ID {organization_id}: {e}")
             return None
 
     def create_organization(self, org_data: Dict[str, Any]) -> Optional[OrganizationModel]:
@@ -212,6 +281,23 @@ class AppwriteClient:
             return self._convert_document_to_model(result, OrganizationModel)
         except Exception as e:
             logger.error(f"Error updating organization {website}: {e}")
+            return None
+
+    def update_organization_by_id(self, organization_id: str, update_data: Dict[str, Any]) -> Optional[OrganizationModel]:
+        """Update organization by ID."""
+        try:
+            update_data['updated_at'] = datetime.utcnow().isoformat() + 'Z'
+            
+            result = self.databases.update_document(
+                database_id='main',
+                collection_id='organizations',
+                document_id=organization_id,
+                data=update_data
+            )
+            
+            return self._convert_document_to_model(result, OrganizationModel)
+        except Exception as e:
+            logger.error(f"Error updating organization by ID {organization_id}: {e}")
             return None
 
     def delete_organization(self, website: str) -> bool:
@@ -296,6 +382,79 @@ class AppwriteClient:
             logger.error(f"Error updating learner {learner_id}: {e}")
             return None
 
+    def update_learners_organization_website(self, old_website: str, new_website: str) -> int:
+        """Update all learners' organization_website from old to new."""
+        try:
+            # Get all learners with the old website
+            learners = self.query_learners_for_org(old_website, limit=10000, offset=0)
+            
+            updated_count = 0
+            for learner in learners:
+                try:
+                    self.databases.update_document(
+                        database_id='main',
+                        collection_id='learners',
+                        document_id=learner.id,
+                        data={'organization_website': new_website}
+                    )
+                    updated_count += 1
+                except Exception as e:
+                    logger.error(f"Error updating learner {learner.id}: {e}")
+                    continue
+            
+            logger.info(f"Updated {updated_count} learners from {old_website} to {new_website}")
+            return updated_count
+        except Exception as e:
+            logger.error(f"Error updating learners organization website: {e}")
+            return 0
+
+    def update_sop_user_organization_website(self, old_website: str, new_website: str) -> int:
+        """Update SOP user's organization_website preference in Appwrite Users collection."""
+        try:
+            from appwrite.services.users import Users
+            
+            users = Users(self.client)
+            
+            # Get organization to find the SOP email
+            organization = self.get_organization_by_website(new_website)
+            if not organization:
+                logger.error(f"Organization with website {new_website} not found")
+                return 0
+            
+            sop_email = organization.sop_email
+            
+            # Find the SOP user by email
+            user_list = users.list(search=sop_email)
+            
+            if not user_list['users']:
+                logger.warning(f"SOP user with email {sop_email} not found")
+                return 0
+            
+            user = user_list['users'][0]
+            user_prefs = user.get('prefs', {})
+            current_org_website = user_prefs.get('organization_website')
+            
+            # Only update if the current preference matches the old website
+            if current_org_website == old_website:
+                # Update user preferences
+                updated_prefs = user_prefs.copy()
+                updated_prefs['organization_website'] = new_website
+                
+                users.update_prefs(
+                    user_id=user['$id'],
+                    prefs=updated_prefs
+                )
+                
+                logger.info(f"Updated SOP user {sop_email} organization_website from {old_website} to {new_website}")
+                return 1
+            else:
+                logger.info(f"SOP user {sop_email} already has correct organization_website: {current_org_website}")
+                return 0
+                
+        except Exception as e:
+            logger.error(f"Error updating SOP user organization website: {e}")
+            return 0
+
     def mark_learner_completed(self, course_id: str, email: str) -> Optional[LearnerModel]:
         """Mark learner as completed."""
         try:
@@ -312,18 +471,25 @@ class AppwriteClient:
             logger.error(f"Error marking learner completed {course_id}/{email}: {e}")
             return None
 
-    def query_learners_for_org(self, organization_website: str, limit: int = 50, offset: int = 0) -> List[LearnerModel]:
-        """Query learners for organization."""
+    def query_learners_for_org(self, organization_website: str, limit: int = 50, offset: int = 0, search: str = None) -> List[LearnerModel]:
+        """Query learners for organization with search."""
         try:
+            queries = [
+                Query.equal('organization_website', organization_website),
+                Query.limit(limit),
+                Query.offset(offset),
+                Query.order_desc('created_at')
+            ]
+            
+            # Add search functionality
+            if search:
+                # Search in learner name using contains (case-insensitive)
+                queries.append(Query.contains('name', search))
+            
             result = self.databases.list_documents(
                 database_id='main',
                 collection_id='learners',
-                queries=[
-                    Query.equal('organization_website', organization_website),
-                    Query.limit(limit),
-                    Query.offset(offset),
-                    Query.order_desc('created_at')
-                ]
+                queries=queries
             )
             
             return [
@@ -334,18 +500,25 @@ class AppwriteClient:
             logger.error(f"Error querying learners for org {organization_website}: {e}")
             return []
 
-    def query_learners_for_course(self, course_id: str, limit: int = 50, offset: int = 0) -> List[LearnerModel]:
-        """Query learners for course."""
+    def query_learners_for_course(self, course_id: str, limit: int = 50, offset: int = 0, search: str = None) -> List[LearnerModel]:
+        """Query learners for course with search."""
         try:
+            queries = [
+                Query.equal('course_id', course_id),
+                Query.limit(limit),
+                Query.offset(offset),
+                Query.order_desc('created_at')
+            ]
+            
+            # Add search functionality
+            if search:
+                # Search in learner name using contains (case-insensitive)
+                queries.append(Query.contains('name', search))
+            
             result = self.databases.list_documents(
                 database_id='main',
                 collection_id='learners',
-                queries=[
-                    Query.equal('course_id', course_id),
-                    Query.limit(limit),
-                    Query.offset(offset),
-                    Query.order_desc('created_at')
-                ]
+                queries=queries
             )
             
             return [
@@ -356,15 +529,41 @@ class AppwriteClient:
             logger.error(f"Error querying learners for course {course_id}: {e}")
             return []
 
+    def query_all_learners(self, limit: int = 50, offset: int = 0, search: str = None) -> List[LearnerModel]:
+        """Query all learners with search."""
+        try:
+            queries = [
+                Query.limit(limit),
+                Query.offset(offset),
+                Query.order_desc('created_at')
+            ]
+            
+            # Add search functionality
+            if search:
+                # Search in learner name using contains (case-insensitive)
+                queries.append(Query.contains('name', search))
+            
+            result = self.databases.list_documents(
+                database_id='main',
+                collection_id='learners',
+                queries=queries
+            )
+            
+            return [
+                self._convert_document_to_model(doc, LearnerModel)
+                for doc in result['documents']
+            ]
+        except Exception as e:
+            logger.error(f"Error querying all learners: {e}")
+            return []
+
     # Webhook operations
     def create_webhook_event(self, event_data: Dict[str, Any]) -> Optional[WebhookEventModel]:
         """Create webhook event."""
         try:
-            event_data.update({
-                'received_at': datetime.utcnow().isoformat() + 'Z',
-                'status': WebhookStatus.RECEIVED.value,
-                'attempts': 0
-            })
+            # Ensure status is set if not provided
+            if 'status' not in event_data:
+                event_data['status'] = WebhookStatus.RECEIVED.value
             
             result = self.databases.create_document(
                 database_id='main',
@@ -413,7 +612,7 @@ class AppwriteClient:
             queries = [
                 Query.limit(limit),
                 Query.offset(offset),
-                Query.order_desc('received_at')
+                Query.order_desc('created_at')
             ]
             
             if status:
@@ -437,10 +636,8 @@ class AppwriteClient:
     def create_email_log(self, log_data: Dict[str, Any]) -> Optional[EmailLogModel]:
         """Create email log."""
         try:
-            log_data.update({
-                'created_at': datetime.utcnow().isoformat() + 'Z',
-                'retry_count': 0
-            })
+            # Don't add extra fields - use only what's provided
+            # The email_logs table has specific required fields
             
             result = self.databases.create_document(
                 database_id='main',
@@ -486,12 +683,19 @@ class AppwriteClient:
     def get_file_download_url(self, file_id: str, bucket_id: str) -> Optional[str]:
         """Get file download URL."""
         try:
-            result = self.storage.get_file_download(
-                bucket_id=bucket_id,
-                file_id=file_id
-            )
+            import os
             
-            return result
+            # Get endpoint and project ID from environment variables
+            endpoint = os.getenv('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
+            project_id = os.getenv('APPWRITE_PROJECT', '68cf04e30030d4b38d19')
+            
+            # Remove /v1 from endpoint if present
+            if endpoint.endswith('/v1'):
+                endpoint = endpoint[:-3]
+            
+            download_url = f"{endpoint}/v1/storage/buckets/{bucket_id}/files/{file_id}/view?project={project_id}"
+            
+            return download_url
         except Exception as e:
             logger.error(f"Error getting file download URL {file_id}: {e}")
             return None
@@ -507,3 +711,100 @@ class AppwriteClient:
         except Exception as e:
             logger.error(f"Error deleting file {file_id}: {e}")
             return False
+
+    def upload_file(self, file_bytes: bytes, filename: str, bucket_id: str, content_type: str = 'application/octet-stream', context=None) -> Optional[Dict[str, Any]]:
+        """Upload file to Appwrite storage."""
+        try:
+            import tempfile
+            import os
+            
+            # Use context logging if available, otherwise use logger
+            def log_msg(msg):
+                if context:
+                    context.log(msg)
+                else:
+                    logger.info(msg)
+            
+            def log_error(msg):
+                if context:
+                    context.error(msg)
+                else:
+                    logger.error(msg)
+            
+            log_msg(f"Starting file upload process for: {filename}")
+            log_msg(f"File size: {len(file_bytes)} bytes")
+            log_msg(f"Target bucket: {bucket_id}")
+            log_msg(f"Content type: {content_type}")
+            
+            # Create a temporary file
+            log_msg("Creating temporary file...")
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                temp_file.write(file_bytes)
+                temp_file_path = temp_file.name
+                log_msg(f"Temporary file created at: {temp_file_path}")
+            
+            try:
+                # Upload file to storage using InputFile
+                log_msg("Opening file for upload...")
+                from appwrite.input_file import InputFile
+                
+                log_msg("Calling Appwrite storage.create_file...")
+                log_msg(f"Parameters: bucket_id={bucket_id}, file_id='unique()', file=InputFile.from_path(temp_file_path), permissions=['read(\"any\")']")
+                
+                result = self.storage.create_file(
+                    bucket_id=bucket_id,
+                    file_id='unique()',
+                    file=InputFile.from_path(temp_file_path),
+                    permissions=['read("any")']  # Allow public read access
+                )
+                
+                log_msg(f"Appwrite storage.create_file completed successfully")
+                log_msg(f"Result type: {type(result)}")
+                log_msg(f"Result content: {result}")
+                
+                if result and isinstance(result, dict):
+                    file_id = result.get('$id')
+                    log_msg(f"File uploaded successfully: {filename} -> {file_id}")
+                    return result
+                else:
+                    log_msg(f"Unexpected result format: {result}")
+                    return None
+                
+            finally:
+                # Clean up temporary file
+                log_msg("Cleaning up temporary file...")
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
+                    log_msg("Temporary file deleted successfully")
+                else:
+                    log_msg("Temporary file not found for cleanup")
+            
+        except Exception as e:
+            log_error(f"Error uploading file {filename}: {e}")
+            import traceback
+            log_error(f"Full traceback: {traceback.format_exc()}")
+            return None
+
+    def get_learners_count_for_org(self, organization_website: str, search: str = None) -> int:
+        """Get total count of learners for organization with optional search."""
+        try:
+            queries = [
+                Query.equal('organization_website', organization_website)
+            ]
+            
+            # Add search functionality
+            if search:
+                # Search in learner name using contains (case-insensitive)
+                queries.append(Query.contains('name', search))
+            
+            # Get count without limit/offset for accurate total
+            result = self.databases.list_documents(
+                database_id='main',
+                collection_id='learners',
+                queries=queries
+            )
+            
+            return len(result['documents'])
+        except Exception as e:
+            logger.error(f"Error getting learners count for org {organization_website}: {e}")
+            return 0

@@ -362,3 +362,90 @@ class AuthService:
                 'ok': False,
                 'error': str(e)
             }
+    
+    def validate_user_password(self, email: str, password: str) -> bool:
+        """Validate user password by attempting to create a session using HTTP API."""
+        try:
+            import requests
+            
+            # Use Appwrite's HTTP API to create a session
+            # This will fail if the password is incorrect
+            try:
+                # Create session using Appwrite's HTTP API
+                session_url = f"{os.getenv('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')}/account/sessions/email"
+                
+                session_data = {
+                    'email': email,
+                    'password': password
+                }
+                
+                headers = {
+                    'Content-Type': 'application/json',
+                    'X-Appwrite-Project': os.getenv('APPWRITE_PROJECT_ID')
+                }
+                
+                response = requests.post(session_url, json=session_data, headers=headers, timeout=10)
+                
+                if response.status_code == 201:
+                    # Session created successfully, password is correct
+                    session_data = response.json()
+                    session_id = session_data.get('$id')
+                    
+                    # Clean up the session immediately
+                    if session_id:
+                        try:
+                            delete_url = f"{os.getenv('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')}/account/sessions/{session_id}"
+                            delete_headers = {
+                                'X-Appwrite-Project': os.getenv('APPWRITE_PROJECT_ID'),
+                                'X-Appwrite-Key': os.getenv('APPWRITE_API_KEY')
+                            }
+                            requests.delete(delete_url, headers=delete_headers, timeout=5)
+                        except:
+                            pass  # Ignore cleanup errors
+                    
+                    logger.info(f"Password validation successful for user {email}")
+                    return True
+                else:
+                    logger.warning(f"Password validation failed for user {email}: HTTP {response.status_code}")
+                    return False
+                
+            except Exception as session_error:
+                logger.warning(f"Password validation failed for user {email}: {session_error}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error validating user password: {e}")
+            return False
+    
+    def get_user_role(self, user_id: str) -> str:
+        """Get user's role from Appwrite."""
+        try:
+            from appwrite.services.users import Users
+            
+            # Initialize Appwrite client
+            from appwrite.client import Client
+            client = Client()
+            client.set_endpoint(os.getenv('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1'))
+            client.set_project(os.getenv('APPWRITE_PROJECT_ID'))
+            client.set_key(os.getenv('APPWRITE_API_KEY'))
+            
+            # Initialize services
+            users = Users(client)
+            
+            # Get user by ID
+            user = users.get(user_id)
+            
+            # Check user labels first (primary role storage)
+            user_labels = user.get('labels', [])
+            if 'admin' in user_labels:
+                return 'admin'
+            elif 'sop' in user_labels:
+                return 'sop'
+            
+            # Fallback to preferences if labels don't have role
+            user_prefs = user.get('prefs', {})
+            return user_prefs.get('role', 'unknown')
+            
+        except Exception as e:
+            logger.error(f"Error getting user role for {user_id}: {e}")
+            return 'unknown'

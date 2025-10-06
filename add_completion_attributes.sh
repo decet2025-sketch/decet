@@ -1,110 +1,130 @@
 #!/bin/bash
 
-# Script to add completion tracking attributes to production database
-# This adds the new fields needed for the completion checker scheduler
+# Load environment variables from .env file
+if [ -f .env ]; then
+  export $(cat .env | xargs)
+fi
 
-set -e
+APPWRITE_ENDPOINT=${APPWRITE_ENDPOINT:-https://cloud.appwrite.io/v1}
+APPWRITE_PROJECT=${APPWRITE_PROJECT:-68cf04e30030d4b38d19} # Replace with your project ID
+APPWRITE_API_KEY=${APPWRITE_API_KEY:-standard_433c1d266b99746da7293cecabc52ca95bb22210e821cfd4292da0a8eadb137d36963b60dd3ecf89f7cf0461a67046c676ceacb273c60dbc1a19da1bc9042cc82e7653cb167498d8504c6abbda8634393289c3335a0cb72eb8d7972249a0b22a10f9195b0d43243116b54f34f7a15ad837a900922e23bcba34c80c5c09635142} # Replace with your API Key
+APPWRITE_DATABASE_ID=${APPWRITE_DATABASE_ID:-main} # Replace with your database ID
 
-APPWRITE_ENDPOINT="https://cloud.appwrite.io/v1"
-APPWRITE_PROJECT_ID="main"
-APPWRITE_API_KEY="standard_433c1d266b99746da7293cecabc52ca95bb22210e821cfd4292da0a8eadb137d36963b60dd3ecf89f7cf0461a67046c676ceacb273c60dbc1a19da1bc9042cc82e7653cb167498d8504c6abbda8634393289c3335a0cb72eb8d7972249a0b22a10f9195b0d43243116b54f34f7a15ad837a900922e23bcba34c80c5c09635142"
+COLLECTION_ID="learners"
 
-echo "🔧 Adding completion tracking attributes to production database..."
+echo "🚀 Adding completion tracking attributes to ${COLLECTION_ID} collection..."
 
-# Add status attribute
-echo "📝 Adding 'status' attribute..."
-curl -X POST "$APPWRITE_ENDPOINT/databases/main/collections/learners/attributes/string" \
-  -H "X-Appwrite-Project: $APPWRITE_PROJECT_ID" \
-  -H "X-Appwrite-Key: $APPWRITE_API_KEY" \
+# Add completion_percentage attribute
+echo "📋 Adding completion_percentage attribute..."
+ADD_ATTRIBUTE_RESPONSE=$(curl -s -X POST "${APPWRITE_ENDPOINT}/databases/${APPWRITE_DATABASE_ID}/collections/${COLLECTION_ID}/attributes/float" \
   -H "Content-Type: application/json" \
-  -d '{
-    "key": "status",
-    "size": 50,
-    "required": true,
-    "default": "enrolled"
-  }'
-
-echo "✅ Status attribute added"
+  -H "X-Appwrite-Project: ${APPWRITE_PROJECT}" \
+  -H "X-Appwrite-Key: ${APPWRITE_API_KEY}" \
+  --data-raw '{
+      "key": "completion_percentage",
+      "required": false,
+      "min": 0,
+      "max": 100
+  }')
+echo "${ADD_ATTRIBUTE_RESPONSE}"
+if echo "${ADD_ATTRIBUTE_RESPONSE}" | grep -q "\"key\":\"completion_percentage\""; then
+  echo "✅ Attribute completion_percentage added successfully!"
+elif echo "${ADD_ATTRIBUTE_RESPONSE}" | grep -q "already exists"; then
+  echo "⚠️ Attribute completion_percentage already exists. Skipping."
+else
+  echo "❌ Failed to add attribute completion_percentage: ${ADD_ATTRIBUTE_RESPONSE}"
+fi
 
 # Add completion_data attribute
-echo "📝 Adding 'completion_data' attribute..."
-curl -X POST "$APPWRITE_ENDPOINT/databases/main/collections/learners/attributes/string" \
-  -H "X-Appwrite-Project: $APPWRITE_PROJECT_ID" \
-  -H "X-Appwrite-Key: $APPWRITE_API_KEY" \
+echo "📋 Adding completion_data attribute..."
+ADD_ATTRIBUTE_RESPONSE=$(curl -s -X POST "${APPWRITE_ENDPOINT}/databases/${APPWRITE_DATABASE_ID}/collections/${COLLECTION_ID}/attributes/string" \
   -H "Content-Type: application/json" \
-  -d '{
-    "key": "completion_data",
-    "size": 5000,
-    "required": false
-  }'
-
-echo "✅ Completion data attribute added"
-
-# Add completed_at attribute
-echo "📝 Adding 'completed_at' attribute..."
-curl -X POST "$APPWRITE_ENDPOINT/databases/main/collections/learners/attributes/datetime" \
-  -H "X-Appwrite-Project: $APPWRITE_PROJECT_ID" \
-  -H "X-Appwrite-Key: $APPWRITE_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "key": "completed_at",
-    "required": false
-  }'
-
-echo "✅ Completed at attribute added"
+  -H "X-Appwrite-Project: ${APPWRITE_PROJECT}" \
+  -H "X-Appwrite-Key: ${APPWRITE_API_KEY}" \
+  --data-raw '{
+      "key": "completion_data",
+      "size": 5000,
+      "required": false,
+      "array": false
+  }')
+echo "${ADD_ATTRIBUTE_RESPONSE}"
+if echo "${ADD_ATTRIBUTE_RESPONSE}" | grep -q "\"key\":\"completion_data\""; then
+  echo "✅ Attribute completion_data added successfully!"
+elif echo "${ADD_ATTRIBUTE_RESPONSE}" | grep -q "already exists"; then
+  echo "⚠️ Attribute completion_data already exists. Skipping."
+else
+  echo "❌ Failed to add attribute completion_data: ${ADD_ATTRIBUTE_RESPONSE}"
+fi
 
 # Add last_completion_check attribute
-echo "📝 Adding 'last_completion_check' attribute..."
-curl -X POST "$APPWRITE_ENDPOINT/databases/main/collections/learners/attributes/datetime" \
-  -H "X-Appwrite-Project: $APPWRITE_PROJECT_ID" \
-  -H "X-Appwrite-Key: $APPWRITE_API_KEY" \
+echo "📋 Adding last_completion_check attribute..."
+ADD_ATTRIBUTE_RESPONSE=$(curl -s -X POST "${APPWRITE_ENDPOINT}/databases/${APPWRITE_DATABASE_ID}/collections/${COLLECTION_ID}/attributes/datetime" \
   -H "Content-Type: application/json" \
-  -d '{
-    "key": "last_completion_check",
-    "required": false
-  }'
+  -H "X-Appwrite-Project: ${APPWRITE_PROJECT}" \
+  -H "X-Appwrite-Key: ${APPWRITE_API_KEY}" \
+  --data-raw '{
+      "key": "last_completion_check",
+      "required": false,
+      "array": false
+  }')
+echo "${ADD_ATTRIBUTE_RESPONSE}"
+if echo "${ADD_ATTRIBUTE_RESPONSE}" | grep -q "\"key\":\"last_completion_check\""; then
+  echo "✅ Attribute last_completion_check added successfully!"
+elif echo "${ADD_ATTRIBUTE_RESPONSE}" | grep -q "already exists"; then
+  echo "⚠️ Attribute last_completion_check already exists. Skipping."
+else
+  echo "❌ Failed to add attribute last_completion_check: ${ADD_ATTRIBUTE_RESPONSE}"
+fi
 
-echo "✅ Last completion check attribute added"
-
-# Add status index
-echo "📝 Adding 'status' index..."
-curl -X POST "$APPWRITE_ENDPOINT/databases/main/collections/learners/indexes" \
-  -H "X-Appwrite-Project: $APPWRITE_PROJECT_ID" \
-  -H "X-Appwrite-Key: $APPWRITE_API_KEY" \
+# Add completion_date attribute
+echo "📋 Adding completion_date attribute..."
+ADD_ATTRIBUTE_RESPONSE=$(curl -s -X POST "${APPWRITE_ENDPOINT}/databases/${APPWRITE_DATABASE_ID}/collections/${COLLECTION_ID}/attributes/datetime" \
   -H "Content-Type: application/json" \
-  -d '{
-    "key": "status_index",
-    "type": "key",
-    "attributes": ["status"]
-  }'
+  -H "X-Appwrite-Project: ${APPWRITE_PROJECT}" \
+  -H "X-Appwrite-Key: ${APPWRITE_API_KEY}" \
+  --data-raw '{
+      "key": "completion_date",
+      "required": false,
+      "array": false
+  }')
+echo "${ADD_ATTRIBUTE_RESPONSE}"
+if echo "${ADD_ATTRIBUTE_RESPONSE}" | grep -q "\"key\":\"completion_date\""; then
+  echo "✅ Attribute completion_date added successfully!"
+elif echo "${ADD_ATTRIBUTE_RESPONSE}" | grep -q "already exists"; then
+  echo "⚠️ Attribute completion_date already exists. Skipping."
+else
+  echo "❌ Failed to add attribute completion_date: ${ADD_ATTRIBUTE_RESPONSE}"
+fi
 
-echo "✅ Status index added"
-
-# Add last_completion_check index
-echo "📝 Adding 'last_completion_check' index..."
-curl -X POST "$APPWRITE_ENDPOINT/databases/main/collections/learners/indexes" \
-  -H "X-Appwrite-Project: $APPWRITE_PROJECT_ID" \
-  -H "X-Appwrite-Key: $APPWRITE_API_KEY" \
+# Add enrollment_status attribute
+echo "📋 Adding enrollment_status attribute..."
+ADD_ATTRIBUTE_RESPONSE=$(curl -s -X POST "${APPWRITE_ENDPOINT}/databases/${APPWRITE_DATABASE_ID}/collections/${COLLECTION_ID}/attributes/string" \
   -H "Content-Type: application/json" \
-  -d '{
-    "key": "last_completion_check_index",
-    "type": "key",
-    "attributes": ["last_completion_check"]
-  }'
+  -H "X-Appwrite-Project: ${APPWRITE_PROJECT}" \
+  -H "X-Appwrite-Key: ${APPWRITE_API_KEY}" \
+  --data-raw '{
+      "key": "enrollment_status",
+      "size": 50,
+      "required": false,
+      "array": false
+  }')
+echo "${ADD_ATTRIBUTE_RESPONSE}"
+if echo "${ADD_ATTRIBUTE_RESPONSE}" | grep -q "\"key\":\"enrollment_status\""; then
+  echo "✅ Attribute enrollment_status added successfully!"
+elif echo "${ADD_ATTRIBUTE_RESPONSE}" | grep -q "already exists"; then
+  echo "⚠️ Attribute enrollment_status already exists. Skipping."
+else
+  echo "❌ Failed to add attribute enrollment_status: ${ADD_ATTRIBUTE_RESPONSE}"
+fi
 
-echo "✅ Last completion check index added"
-
 echo ""
-echo "🎉 All completion tracking attributes added to production database!"
+echo "🎉 Completion tracking attributes setup completed!"
 echo ""
-echo "📋 Added attributes:"
-echo "  - status (string, 50 chars, required, default: 'enrolled')"
-echo "  - completion_data (string, 5000 chars, optional)"
-echo "  - completed_at (datetime, optional)"
-echo "  - last_completion_check (datetime, optional)"
+echo "📋 Added Attributes:"
+echo "   - completion_percentage (float, 0-100)"
+echo "   - completion_data (string, 5000 chars)"
+echo "   - last_completion_check (datetime)"
+echo "   - completion_date (datetime)"
+echo "   - enrollment_status (string, 50 chars)"
 echo ""
-echo "📋 Added indexes:"
-echo "  - status_index (for querying enrolled learners)"
-echo "  - last_completion_check_index (for tracking check history)"
-echo ""
-echo "🚀 Your completion checker scheduler is now ready to use!"
+echo "🚀 Ready for completion tracking!"

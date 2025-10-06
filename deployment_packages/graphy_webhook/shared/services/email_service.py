@@ -4,23 +4,22 @@ Email service using Appwrite's built-in SMTP functionality.
 
 import logging
 import os
+import time
 from typing import Optional, Dict, Any
+
+logger = logging.getLogger(__name__)
+
 try:
-    from appwrite.services.messaging import Messaging
     from appwrite.client import Client
     MESSAGING_AVAILABLE = True
-except ImportError:
+    logger.info("Appwrite Client imported successfully")
+except ImportError as e:
     MESSAGING_AVAILABLE = False
-    # Fallback for when messaging service is not available
-    class Messaging:
-        def __init__(self, client):
-            pass
+    logger.warning(f"Appwrite Client not available: {e}")
     class Client:
         pass
 
 from ..models import EmailRequest, EmailResponse
-
-logger = logging.getLogger(__name__)
 
 
 class EmailService:
@@ -29,17 +28,21 @@ class EmailService:
     def __init__(self, appwrite_client: Client):
         """Initialize email service with Appwrite client."""
         self.client = appwrite_client
-        if MESSAGING_AVAILABLE:
-            self.messaging = Messaging(appwrite_client)
-        else:
-            self.messaging = None
+        logger.info(f"MESSAGING_AVAILABLE: {MESSAGING_AVAILABLE}")
         
-        # Gmail SMTP configuration
+        # Get Appwrite configuration
+        self.endpoint = os.getenv('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
+        self.project_id = os.getenv('APPWRITE_PROJECT', '68cf04e30030d4b38d19')
+        self.api_key = os.getenv('APPWRITE_API_KEY', 'standard_433c1d266b99746da7293cecabc52ca95bb22210e821cfd4292da0a8eadb137d36963b60dd3ecf89f7cf0461a67046c676ceacb273c60dbc1a19da1bc9042cc82e7653cb167498d8504c6abbda8634393289c3335a0cb72eb8d7972249a0b22a10f9195b0d43243116b54f34f7a15ad837a900922e23bcba34c80c5c09635142')
+        
+        logger.info("Email service initialized with Appwrite HTTP API")
+        
+        # Gmail SMTP configuration (from Appwrite console)
         self.smtp_config = {
             'host': 'smtp.gmail.com',
             'port': 587,
             'username': 'decet2025@gmail.com',
-            'password': os.getenv('GMAIL_APP_PASSWORD'),  # App-specific password
+            'password': 'szwk lgbw xkhh kocj',  # Gmail app password from Appwrite console
             'use_tls': True,
             'from_email': 'decet2025@gmail.com'
         }
@@ -61,19 +64,45 @@ class EmailService:
                 # This is a limitation of Appwrite's messaging service
                 logger.warning("Attachments not directly supported in Appwrite messaging. Consider using secure links.")
             
-            # Send email via Appwrite
-            result = self.messaging.create_email(
-                message_id='unique',  # Appwrite will generate this
-                subject=request.subject,
-                html=request.body,
-                text=request.body.replace('<br>', '\n').replace('<p>', '').replace('</p>', '\n'),
-                to=[request.to_email],
-                cc=[],
-                bcc=[],
-                attachments=[],
-                draft=False,
-                scheduled_at=None
-            )
+            # Send email via direct SMTP (Appwrite messaging API only works with registered users)
+            logger.info(f"Attempting to send email via direct SMTP to external address: {request.to_email}")
+            
+            import smtplib
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+            from email.mime.application import MIMEApplication
+            
+            # Create message
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = request.subject
+            msg['From'] = self.smtp_config['from_email']
+            msg['To'] = request.to_email
+            
+            # Add text and HTML parts
+            text_part = MIMEText(request.body.replace('<br>', '\n').replace('<p>', '').replace('</p>', '\n'), 'plain')
+            html_part = MIMEText(request.body, 'html')
+            
+            msg.attach(text_part)
+            msg.attach(html_part)
+            
+            # Add attachment if provided
+            if attachment_content and request.attachment_filename:
+                attachment = MIMEApplication(attachment_content, _subtype='pdf')
+                attachment.add_header('Content-Disposition', 'attachment', filename=request.attachment_filename)
+                msg.attach(attachment)
+                logger.info(f"Added attachment: {request.attachment_filename}")
+            
+            # Send email via SMTP
+            logger.info(f"Connecting to SMTP server: {self.smtp_config['host']}:{self.smtp_config['port']}")
+            logger.info(f"Using credentials: {self.smtp_config['username']}")
+            
+            with smtplib.SMTP(self.smtp_config['host'], self.smtp_config['port']) as server:
+                server.starttls()
+                server.login(self.smtp_config['username'], self.smtp_config['password'])
+                server.send_message(msg)
+                logger.info(f"Email sent successfully to {request.to_email} via SMTP")
+            
+            result = {'$id': f'smtp-{int(time.time())}'}
             
             logger.info(f"Email sent successfully to {request.to_email} via Appwrite")
             return EmailResponse(
@@ -86,53 +115,11 @@ class EmailService:
             return EmailResponse(ok=False, error=str(e))
 
     def send_email_with_attachment(self, request: EmailRequest, attachment_content: bytes, attachment_filename: str) -> EmailResponse:
-        """Send email with attachment by storing file in Appwrite Storage and including secure link."""
+        """Send email with attachment via direct SMTP."""
         try:
-            from appwrite.services.storage import Storage
-            
-            storage = Storage(self.client)
-            
-            # Upload attachment to Appwrite Storage
-            file_result = storage.create_file(
-                bucket_id=os.getenv('CERTIFICATES_BUCKET_ID', 'certificates'),
-                file_id='unique',  # Appwrite will generate this
-                file=attachment_content,
-                name=attachment_filename,
-                mime_type='application/pdf'
-            )
-            
-            # Get secure download URL
-            download_url = storage.get_file_download(
-                bucket_id=os.getenv('CERTIFICATES_BUCKET_ID', 'certificates'),
-                file_id=file_result['$id']
-            )
-            
-            # Update email body to include download link
-            updated_body = f"""
-            {request.body}
-            
-            <div style="margin-top: 20px; padding: 15px; background-color: #f8f9fa; border-left: 4px solid #007bff;">
-                <h3>📄 Certificate Download</h3>
-                <p>Your certificate is ready for download:</p>
-                <a href="{download_url}" style="display: inline-block; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px;">
-                    Download Certificate
-                </a>
-                <p style="font-size: 12px; color: #666; margin-top: 10px;">
-                    This link will expire in 7 days for security reasons.
-                </p>
-            </div>
-            """
-            
-            # Create updated request
-            updated_request = EmailRequest(
-                to_email=request.to_email,
-                subject=request.subject,
-                body=updated_body
-            )
-            
-            # Send email with download link
-            return self.send_email(updated_request)
-            
+            # Use the main send_email method which now handles attachments via SMTP
+            return self.send_email(request, attachment_content)
+                
         except Exception as e:
             logger.error(f"Error sending email with attachment: {e}")
             return EmailResponse(ok=False, error=str(e))
@@ -198,6 +185,31 @@ class EmailService:
             return self.send_email_with_attachment(email_request, attachment_content, attachment_filename)
         else:
             return self.send_email(email_request)
+
+    def send_certificate_email_html(
+        self,
+        to_email: str,
+        learner_name: str,
+        learner_email: str,
+        course_name: str,
+        organization_name: str,
+        html_content: str
+    ) -> EmailResponse:
+        """Send certificate email with HTML content instead of PDF attachment."""
+        try:
+            # Create email request with HTML content
+            email_request = EmailRequest(
+                to_email=to_email,
+                subject=f'Certificate of Completion - {course_name}',
+                body=html_content  # HTML content is sent as the email body
+            )
+            
+            logger.info(f"Sending HTML certificate email to {to_email}")
+            return self.send_email(email_request)
+            
+        except Exception as e:
+            logger.error(f"Error sending HTML certificate email: {e}")
+            return EmailResponse(ok=False, error=str(e))
 
     def test_connection(self) -> Dict[str, Any]:
         """Test email service connection."""

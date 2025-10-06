@@ -28,11 +28,18 @@ class GraphyWebhookHandler:
 
     def __init__(self):
         """Initialize webhook handler."""
+        # Get Appwrite configuration with fallbacks
+        endpoint = os.getenv('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')
+        project_id = os.getenv('APPWRITE_PROJECT', '68cf04e30030d4b38d19')
+        api_key = os.getenv('APPWRITE_API_KEY', 'standard_433c1d266b99746da7293cecabc52ca95bb22210e821cfd4292da0a8eadb137d36963b60dd3ecf89f7cf0461a67046c676ceacb273c60dbc1a19da1bc9042cc82e7653cb167498d8504c6abbda8634393289c3335a0cb72eb8d7972249a0b22a10f9195b0d43243116b54f34f7a15ad837a900922e23bcba34c80c5c09635142')
+        
+        logger.info(f"Database client config - endpoint: {endpoint}, project: {project_id}, api_key: {api_key[:20] if api_key else 'None'}...")
+        
         # Initialize Appwrite client
         self.db = AppwriteClient(
-            endpoint=os.getenv('APPWRITE_ENDPOINT'),
-            project_id=os.getenv('APPWRITE_PROJECT'),
-            api_key=os.getenv('APPWRITE_API_KEY')
+            endpoint=endpoint,
+            project_id=project_id,
+            api_key=api_key
         )
         
         # Initialize Graphy service for signature verification
