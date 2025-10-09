@@ -17,11 +17,12 @@ sys.path.insert(0, current_dir)
 
 from shared.models import (
     WebhookEventModel, WebhookStatus, CertificateContext,
-    CertificateSendStatus, EmailStatus
+    CertificateSendStatus, EmailStatus, ActivityType, ActivityStatus
 )
 from shared.services.db import AppwriteClient
 from shared.services.email_service import EmailService
 from shared.services.renderer import CertificateRenderer
+from shared.services.activity_log import ActivityLogService
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -56,6 +57,9 @@ class CertificateWorker:
         self.renderer = CertificateRenderer(
             html_to_pdf_api_url=os.getenv('HTML_TO_PDF_API_URL')
         )
+        
+        # Initialize activity log service
+        self.activity_log = ActivityLogService(self.db.client)
         
         # Configuration
         self.certificate_bucket_id = os.getenv('CERTIFICATE_BUCKET_ID', 'certificates')
@@ -259,6 +263,52 @@ class CertificateWorker:
                 logger.info(f"Email log created: {email_log}")
             except Exception as e:
                 logger.error(f"Failed to create email log: {e}")
+            
+            # Log activity for certificate sending
+            if email_result['ok']:
+                try:
+                    self.activity_log.log_activity(
+                        activity_type=ActivityType.CERTIFICATE_SENT,
+                        actor="System",
+                        actor_email=None,
+                        actor_role="system",
+                        target=learner.name,
+                        target_email=learner.email,
+                        organization_website=org.website,
+                        course_id=course.course_id,
+                        details=f"Certificate sent to {org.sop_email} for {learner.name} ({learner.email}) - Course: {course.name}",
+                        status=ActivityStatus.SUCCESS,
+                        metadata={
+                            'certificate_filename': pdf_result.get('filename'),
+                            'sop_email': org.sop_email,
+                            'webhook_event_id': webhook_event.id
+                        }
+                    )
+                    self._log(f"Activity logged: Certificate sent for {learner.email}")
+                except Exception as e:
+                    self._log(f"Failed to log certificate sent activity: {e}")
+            else:
+                try:
+                    self.activity_log.log_activity(
+                        activity_type=ActivityType.CERTIFICATE_SENT,
+                        actor="System",
+                        actor_email=None,
+                        actor_role="system",
+                        target=learner.name,
+                        target_email=learner.email,
+                        organization_website=org.website,
+                        course_id=course.course_id,
+                        details=f"Certificate sending failed for {learner.name} ({learner.email}) - Course: {course.name}",
+                        status=ActivityStatus.FAILED,
+                        error_message=email_result.get('error', 'Unknown error'),
+                        metadata={
+                            'sop_email': org.sop_email,
+                            'webhook_event_id': webhook_event.id
+                        }
+                    )
+                    self._log(f"Activity logged: Certificate sending failed for {learner.email}")
+                except Exception as e:
+                    self._log(f"Failed to log certificate failed activity: {e}")
             
             if not email_result['ok']:
                 # Schedule retry if email failed

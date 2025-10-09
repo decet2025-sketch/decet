@@ -22,7 +22,7 @@ from shared.models import (
     ActionRequest, ActionType, BaseResponse,
     CreateCoursePayload, EditCoursePayload, DeleteCoursePayload,
     PreviewCertificatePayload, ListCoursesPayload, ViewLearnersPayload, ListAllLearnersPayload,
-    AddOrganizationPayload, EditOrganizationPayload, DeleteOrganizationPayload, ListOrganizationsPayload,
+    AddOrganizationPayload, EditOrganizationPayload, DeleteOrganizationPayload, ListOrganizationsPayload, ResetSOPPasswordPayload,
     UploadLearnersCSVPayload, UploadLearnersCSVDirectPayload, ResendCertificatePayload, DownloadCertificatePayload, ListWebhooksPayload,
     RetryWebhookPayload, CSVValidationResult, UploadResult, EnrollmentResult,
     CertificateContext, LearnerCSVRow, GraphyEnrollmentRequest,
@@ -285,9 +285,17 @@ class AdminRouter:
                 
                 # Get user by email to verify they exist and get their details
                 users = Users(self.db.client)
-                user_list = users.list(search=email)
+                user_list = users.list()
                 
-                if not user_list['users']:
+                # Find exact email match
+                user = None
+                if user_list['total'] > 0:
+                    for u in user_list['users']:
+                        if u.get('email', '').lower() == email.lower():
+                            user = u
+                            break
+                
+                if not user:
                     return {
                         'ok': False,
                         'status': 401,
@@ -296,8 +304,6 @@ class AdminRouter:
                             'message': 'Invalid email or password'
                         }
                     }
-                
-                user = user_list['users'][0]
                 
                 # Check if user has SOP role
                 actual_role = self.auth.get_user_role(user['$id'])
@@ -458,6 +464,7 @@ class AdminRouter:
                 ActionType.EDIT_ORGANIZATION: self._handle_edit_organization,
                 ActionType.DELETE_ORGANIZATION: self._handle_delete_organization,
                 ActionType.LIST_ORGANIZATIONS: self._handle_list_organizations,
+                ActionType.RESET_SOP_PASSWORD: self._handle_reset_sop_password,
                 ActionType.RESEND_CERTIFICATE: self._handle_resend_certificate,
                 ActionType.DOWNLOAD_CERTIFICATE: self._handle_download_certificate,
                 ActionType.LIST_WEBHOOKS: self._handle_list_webhooks,
@@ -1286,13 +1293,11 @@ class AdminRouter:
                     from appwrite.query import Query
                     queries = [
                         Query.limit(1000),
-                        Query.offset(0)
+                        Query.offset(0),
+                        Query.order_desc('$createdAt')
                     ]
                     
-                    # Add search filter if provided
-                    if list_data.search:
-                        queries.append(Query.contains('name', list_data.search))
-                    
+                    # Get all learners first (no search filter at database level for wildcard search)
                     result = self.db.databases.list_documents(
                         database_id='main',
                         collection_id='learners',
@@ -1302,10 +1307,17 @@ class AdminRouter:
                     for doc in result['documents']:
                         learner = self.db._convert_document_to_model(doc, LearnerModel)
                         if learner:
-                            # Additional client-side filtering for email search
-                            if list_data.search and list_data.search.lower() not in learner.name.lower() and list_data.search.lower() not in learner.email.lower():
-                                continue
                             all_learners.append(learner)
+                    
+                    # Apply wildcard search filter in Python if provided (search across name, email, and organization_website)
+                    if list_data.search:
+                        search_term = list_data.search.lower()
+                        all_learners = [
+                            learner for learner in all_learners
+                            if (search_term in learner.name.lower() or 
+                                search_term in learner.email.lower() or 
+                                search_term in learner.organization_website.lower())
+                        ]
                             
                     logger.info(f"Found {len(all_learners)} learners from database with search: {list_data.search}")
                 except Exception as e:
@@ -1457,25 +1469,11 @@ class AdminRouter:
                     }
                 }
             
-            # Create organization
-            org = self.db.create_organization({
-                'website': org_data.website,
-                'name': org_data.name,
-                'sop_email': org_data.sop_email
-            })
-            
-            if not org:
-                return {
-                    'ok': False,
-                    'status': 500,
-                    'error': {
-                        'code': 'CREATE_FAILED',
-                        'message': 'Failed to create organization'
-                    }
-                }
-            
-            # Create SOP user in Appwrite's built-in auth table
+            # Create SOP user in Appwrite's built-in auth table FIRST
+            # This ensures we don't create an organization without a valid SOP user
             sop_user_created = False
+            sop_user_result = None
+            
             try:
                 sop_user_result = self.auth.create_user_in_appwrite(
                     email=org_data.sop_email,
@@ -1485,16 +1483,51 @@ class AdminRouter:
                     organization_website=org_data.website
                 )
                 
-                if sop_user_result:
+                if sop_user_result and sop_user_result.get('ok'):
                     sop_user_created = True
                     logger.info(f"SOP user created successfully for organization {org_data.website}")
                 else:
-                    logger.warning(f"Failed to create SOP user for organization {org_data.website}")
+                    error_msg = sop_user_result.get('error', 'Unknown error') if sop_user_result else 'No response from auth service'
+                    logger.error(f"Failed to create SOP user for organization {org_data.website}: {error_msg}")
+                    return {
+                        'ok': False,
+                        'status': 500,
+                        'error': {
+                            'code': 'SOP_USER_CREATION_FAILED',
+                            'message': f'Failed to create SOP user: {error_msg}'
+                        }
+                    }
                     
             except Exception as sop_error:
                 logger.error(f"Error creating SOP user for organization {org_data.website}: {sop_error}")
-                # Don't fail the organization creation if SOP user creation fails
-                # The admin can manually create the SOP user later
+                return {
+                    'ok': False,
+                    'status': 500,
+                    'error': {
+                        'code': 'SOP_USER_CREATION_ERROR',
+                        'message': f'Error creating SOP user: {str(sop_error)}'
+                    }
+                }
+            
+            # Only create organization if SOP user was created successfully
+            org = self.db.create_organization({
+                'website': org_data.website,
+                'name': org_data.name,
+                'sop_email': org_data.sop_email
+            })
+            
+            if not org:
+                # If organization creation fails after SOP user was created,
+                # we should clean up the SOP user (though this is complex with Appwrite)
+                logger.error(f"Failed to create organization after SOP user was created for {org_data.website}")
+                return {
+                    'ok': False,
+                    'status': 500,
+                    'error': {
+                        'code': 'ORGANIZATION_CREATION_FAILED',
+                        'message': 'Failed to create organization after SOP user was created'
+                    }
+                }
             
             # Log activity (with error handling to not break main functionality)
             try:
@@ -1788,6 +1821,79 @@ class AdminRouter:
                 }
             }
 
+    def _handle_reset_sop_password(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+        """Handle RESET_SOP_PASSWORD action."""
+        try:
+            # Validate payload
+            reset_data = ResetSOPPasswordPayload(**payload)
+            
+            # Reset SOP user password directly using email
+            reset_result = self.auth.reset_user_password(reset_data.sop_email, reset_data.new_password)
+            
+            if not reset_result.get('ok'):
+                return {
+                    'ok': False,
+                    'status': 500,
+                    'error': {
+                        'code': 'PASSWORD_RESET_FAILED',
+                        'message': f'Failed to reset password: {reset_result.get("error")}'
+                    }
+                }
+            
+            # Get organization info for logging (optional)
+            org = None
+            try:
+                # Try to find organization by SOP email for logging purposes
+                orgs = self.db.list_organizations(limit=1000, offset=0)
+                for o in orgs:
+                    if o.sop_email == reset_data.sop_email:
+                        org = o
+                        break
+            except Exception as e:
+                logger.warning(f"Could not find organization for SOP email {reset_data.sop_email}: {e}")
+            
+            # Log activity
+            try:
+                self.activity_log.log_activity(
+                    activity_type=ActivityType.ORGANIZATION_UPDATED,
+                    actor="Admin User",
+                    actor_email=auth_context.email,
+                    actor_role=auth_context.role.value,
+                    target=org.name if org else reset_data.sop_email,
+                    organization_website=org.website if org else None,
+                    details=f"SOP password reset for {reset_data.sop_email}",
+                    status=ActivityStatus.SUCCESS,
+                    metadata={
+                        'sop_email': reset_data.sop_email,
+                        'action': 'password_reset'
+                    }
+                )
+                logger.info(f"Activity logged: SOP password reset for {reset_data.sop_email}")
+            except Exception as e:
+                logger.warning(f"Failed to log password reset activity: {e}")
+            
+            return {
+                'ok': True,
+                'status': 200,
+                'data': {
+                    'message': f'SOP password reset successfully for {reset_data.sop_email}',
+                    'sop_email': reset_data.sop_email,
+                    'organization_website': org.website if org else None,
+                    'organization_name': org.name if org else None
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error resetting SOP password: {e}")
+            return {
+                'ok': False,
+                'status': 500,
+                'error': {
+                    'code': 'INTERNAL_ERROR',
+                    'message': f'Internal server error: {str(e)}'
+                }
+            }
+
     def _handle_resend_certificate(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
         """Handle RESEND_CERTIFICATE action (SOP-initiated)."""
         try:
@@ -1850,6 +1956,33 @@ class AdminRouter:
                         'certificate_send_status': 'sent',
                         # 'last_resend_attempt': datetime.utcnow().isoformat() + 'Z'
                     })
+
+                    # Log activity for certificate resending
+                    try:
+                        course = self.db.get_course_by_course_id(resend_data.course_id)
+                        org = self.db.get_organization_by_website(learner.organization_website)
+                        course_name = course.name if course else "Unknown Course"
+                        org_name = org.name if org else learner.organization_website
+                        
+                        self.activity_log.log_activity(
+                            activity_type=ActivityType.CERTIFICATE_RESENT,
+                            actor="Admin User",
+                            actor_email=auth_context.email,
+                            actor_role=auth_context.role.value,
+                            target=learner.name,
+                            target_email=learner.email,
+                            organization_website=learner.organization_website,
+                            course_id=resend_data.course_id,
+                            details=f"Certificate resent for {learner.name} ({learner.email}) - Course: {course_name}",
+                            status=ActivityStatus.SUCCESS,
+                            metadata={
+                                'webhook_event_id': webhook_event_id,
+                                'organization_name': org_name
+                            }
+                        )
+                        logger.info(f"Activity logged: Certificate resent for {learner.email}")
+                    except Exception as e:
+                        logger.warning(f"Failed to log certificate resent activity: {e}")
 
                     return {
                         'ok': True,
@@ -1936,6 +2069,35 @@ class AdminRouter:
                                     'certificate_send_status': 'sent',
                                     'last_resend_attempt': datetime.utcnow().isoformat() + 'Z'
                                 })
+                                
+                                # Log activity for certificate resending
+                                try:
+                                    course = self.db.get_course_by_course_id(learner.course_id)
+                                    org = self.db.get_organization_by_website(learner.organization_website)
+                                    course_name = course.name if course else "Unknown Course"
+                                    org_name = org.name if org else learner.organization_website
+                                    
+                                    self.activity_log.log_activity(
+                                        activity_type=ActivityType.CERTIFICATE_RESENT,
+                                        actor="Admin User",
+                                        actor_email=auth_context.email,
+                                        actor_role=auth_context.role.value,
+                                        target=learner.name,
+                                        target_email=learner.email,
+                                        organization_website=learner.organization_website,
+                                        course_id=learner.course_id,
+                                        details=f"Certificate resent for {learner.name} ({learner.email}) - Course: {course_name} (Organization-wide resend)",
+                                        status=ActivityStatus.SUCCESS,
+                                        metadata={
+                                            'webhook_event_id': webhook_event_id,
+                                            'organization_name': org_name,
+                                            'organization_wide_resend': True
+                                        }
+                                    )
+                                    logger.info(f"Activity logged: Certificate resent for {learner.email}")
+                                except Exception as e:
+                                    logger.warning(f"Failed to log certificate resent activity: {e}")
+                                
                                 successful_resends += 1
                             else:
                                 logger.error(f"Certificate resend failed for {learner.email}: {cert_result.get('error')}")
@@ -2231,7 +2393,7 @@ class AdminRouter:
             stats_data = LearnerStatisticsPayload(**payload)
             
             # Get all learners across all organizations
-            organizations = self.db.list_organizations(limit=1000, offset=0)
+            organizations, _ = self.db.list_organizations(limit=1000, offset=0)
             all_learners = []
             
             for org in organizations:
@@ -2288,7 +2450,7 @@ class AdminRouter:
             stats_data = OrganizationStatisticsPayload(**payload)
             
             # Get all organizations
-            organizations = self.db.list_organizations(limit=1000, offset=0)
+            organizations, _ = self.db.list_organizations(limit=1000, offset=0)
             
             # Calculate metrics
             total_organizations = len(organizations)

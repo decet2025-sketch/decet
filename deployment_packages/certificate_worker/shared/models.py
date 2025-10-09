@@ -23,6 +23,7 @@ class ActionType(str, Enum):
     EDIT_ORGANIZATION = "EDIT_ORGANIZATION"
     DELETE_ORGANIZATION = "DELETE_ORGANIZATION"
     LIST_ORGANIZATIONS = "LIST_ORGANIZATIONS"
+    RESET_SOP_PASSWORD = "RESET_SOP_PASSWORD"
     RESEND_CERTIFICATE = "RESEND_CERTIFICATE"
     LIST_WEBHOOKS = "LIST_WEBHOOKS"
     RETRY_WEBHOOK = "RETRY_WEBHOOK"
@@ -198,6 +199,12 @@ class ListOrganizationsPayload(BaseModel):
 class DeleteOrganizationPayload(BaseModel):
     """Payload for deleting an organization."""
     website: str = Field(..., min_length=1, max_length=255)
+
+
+class ResetSOPPasswordPayload(BaseModel):
+    """Payload for resetting SOP password."""
+    sop_email: EmailStr
+    new_password: str = Field(..., min_length=6, max_length=100)
 
 
 # Learner Models

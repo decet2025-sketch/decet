@@ -155,7 +155,7 @@ class AppwriteClient:
             data_queries = filter_queries + [
                 Query.limit(limit),
                 Query.offset(offset),
-                Query.order_desc('created_at')
+                Query.order_desc('$createdAt')
             ]
             
             result = self.databases.list_documents(
@@ -194,7 +194,7 @@ class AppwriteClient:
             data_queries = filter_queries + [
                 Query.limit(limit),
                 Query.offset(offset),
-                Query.order_asc('name')
+                Query.order_desc('$createdAt')
             ]
             
             result = self.databases.list_documents(
@@ -476,26 +476,37 @@ class AppwriteClient:
         try:
             queries = [
                 Query.equal('organization_website', organization_website),
-                Query.limit(limit),
-                Query.offset(offset),
-                Query.order_desc('created_at')
+                Query.limit(1000),  # Get more to account for client-side filtering
+                Query.offset(0),    # Reset offset for client-side filtering
+                Query.order_desc('$createdAt')
             ]
             
-            # Add search functionality
-            if search:
-                # Search in learner name using contains (case-insensitive)
-                queries.append(Query.contains('name', search))
-            
+            # Get all learners for organization first (no search filter at database level)
             result = self.databases.list_documents(
                 database_id='main',
                 collection_id='learners',
                 queries=queries
             )
             
-            return [
+            learners = [
                 self._convert_document_to_model(doc, LearnerModel)
                 for doc in result['documents']
             ]
+            
+            # Apply wildcard search filter in Python if provided (search across name, email, and organization_website)
+            if search:
+                search_term = search.lower()
+                learners = [
+                    learner for learner in learners
+                    if (search_term in learner.name.lower() or 
+                        search_term in learner.email.lower() or 
+                        search_term in learner.organization_website.lower())
+                ]
+            
+            # Apply pagination after filtering
+            start_idx = offset
+            end_idx = offset + limit
+            return learners[start_idx:end_idx]
         except Exception as e:
             logger.error(f"Error querying learners for org {organization_website}: {e}")
             return []
@@ -505,26 +516,37 @@ class AppwriteClient:
         try:
             queries = [
                 Query.equal('course_id', course_id),
-                Query.limit(limit),
-                Query.offset(offset),
-                Query.order_desc('created_at')
+                Query.limit(1000),  # Get more to account for client-side filtering
+                Query.offset(0),    # Reset offset for client-side filtering
+                Query.order_desc('$createdAt')
             ]
             
-            # Add search functionality
-            if search:
-                # Search in learner name using contains (case-insensitive)
-                queries.append(Query.contains('name', search))
-            
+            # Get all learners for course first (no search filter at database level)
             result = self.databases.list_documents(
                 database_id='main',
                 collection_id='learners',
                 queries=queries
             )
             
-            return [
+            learners = [
                 self._convert_document_to_model(doc, LearnerModel)
                 for doc in result['documents']
             ]
+            
+            # Apply wildcard search filter in Python if provided (search across name, email, and organization_website)
+            if search:
+                search_term = search.lower()
+                learners = [
+                    learner for learner in learners
+                    if (search_term in learner.name.lower() or 
+                        search_term in learner.email.lower() or 
+                        search_term in learner.organization_website.lower())
+                ]
+            
+            # Apply pagination after filtering
+            start_idx = offset
+            end_idx = offset + limit
+            return learners[start_idx:end_idx]
         except Exception as e:
             logger.error(f"Error querying learners for course {course_id}: {e}")
             return []
@@ -535,7 +557,7 @@ class AppwriteClient:
             queries = [
                 Query.limit(limit),
                 Query.offset(offset),
-                Query.order_desc('created_at')
+                Query.order_desc('$createdAt')
             ]
             
             # Add search functionality
@@ -612,7 +634,7 @@ class AppwriteClient:
             queries = [
                 Query.limit(limit),
                 Query.offset(offset),
-                Query.order_desc('created_at')
+                Query.order_desc('$createdAt')
             ]
             
             if status:

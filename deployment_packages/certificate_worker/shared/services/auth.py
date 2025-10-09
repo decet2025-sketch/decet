@@ -286,22 +286,27 @@ class AuthService:
             
             # First, try to find existing user by email
             try:
-                # Search for user by email
-                existing_users = users.list(
-                    search=email
-                )
+                # Search for user by email - get all users and filter by exact email match
+                existing_users = users.list()
                 
+                # Find exact email match
+                exact_match = None
                 if existing_users['total'] > 0:
-                    # User exists, return existing user data
-                    existing_user = existing_users['users'][0]
-                    logger.info(f"User {email} already exists with ID {existing_user['$id']}")
+                    for user in existing_users['users']:
+                        if user.get('email', '').lower() == email.lower():
+                            exact_match = user
+                            break
+                
+                if exact_match:
+                    # User exists with exact email match, return existing user data
+                    logger.info(f"User {email} already exists with ID {exact_match['$id']}")
                     
                     return {
                         'ok': True,
                         'data': {
-                            '$id': existing_user['$id'],
-                            'email': existing_user['email'],
-                            'name': existing_user['name'],
+                            '$id': exact_match['$id'],
+                            'email': exact_match['email'],
+                            'name': exact_match['name'],
                             'role': role,
                             'organization_website': organization_website,
                             'existing': True  # Flag to indicate this is an existing user
@@ -449,3 +454,57 @@ class AuthService:
         except Exception as e:
             logger.error(f"Error getting user role for {user_id}: {e}")
             return 'unknown'
+    
+    def reset_user_password(self, email: str, new_password: str) -> Dict[str, Any]:
+        """Reset user password in Appwrite Users collection."""
+        try:
+            from appwrite.services.users import Users
+            from appwrite.client import Client
+            
+            # Initialize Appwrite client
+            client = Client()
+            client.set_endpoint(os.getenv('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1'))
+            client.set_project(os.getenv('APPWRITE_PROJECT_ID'))
+            client.set_key(os.getenv('APPWRITE_API_KEY'))
+            
+            # Initialize Users service
+            users = Users(client)
+            
+            # Find user by exact email match
+            user_list = users.list()
+            user = None
+            if user_list['total'] > 0:
+                for u in user_list['users']:
+                    if u.get('email', '').lower() == email.lower():
+                        user = u
+                        break
+            
+            if not user:
+                return {
+                    'ok': False,
+                    'error': f'User with email {email} not found'
+                }
+            
+            # Update user password
+            users.update_password(
+                user_id=user['$id'],
+                password=new_password
+            )
+            
+            logger.info(f"Password reset successfully for user {email}")
+            
+            return {
+                'ok': True,
+                'data': {
+                    'user_id': user['$id'],
+                    'email': user['email'],
+                    'name': user['name']
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error resetting password for {email}: {e}")
+            return {
+                'ok': False,
+                'error': str(e)
+            }

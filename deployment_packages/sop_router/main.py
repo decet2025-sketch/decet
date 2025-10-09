@@ -454,6 +454,33 @@ class SOPRouter:
                         # 'last_resend_attempt': datetime.utcnow().isoformat() + 'Z'
                     })
 
+                    # Log activity for certificate resending
+                    try:
+                        course = self.db.get_course_by_course_id(resend_data.course_id)
+                        org = self.db.get_organization_by_website(learner.organization_website)
+                        course_name = course.name if course else "Unknown Course"
+                        org_name = org.name if org else learner.organization_website
+                        
+                        self.activity_log.log_activity(
+                            activity_type=ActivityType.CERTIFICATE_RESENT,
+                            actor="SOP User",
+                            actor_email=auth_context.email,
+                            actor_role=auth_context.role.value,
+                            target=learner.name,
+                            target_email=learner.email,
+                            organization_website=learner.organization_website,
+                            course_id=resend_data.course_id,
+                            details=f"Certificate resent for {learner.name} ({learner.email}) - Course: {course_name}",
+                            status=ActivityStatus.SUCCESS,
+                            metadata={
+                                'webhook_event_id': webhook_event_id,
+                                'organization_name': org_name
+                            }
+                        )
+                        logger.info(f"Activity logged: Certificate resent for {learner.email}")
+                    except Exception as e:
+                        logger.warning(f"Failed to log certificate resent activity: {e}")
+
                     return {
                         'ok': True,
                         'status': 200,
@@ -542,6 +569,35 @@ class SOPRouter:
                                     'certificate_send_status': 'sent',
                                     'last_resend_attempt': datetime.utcnow().isoformat() + 'Z'
                                 })
+                                
+                                # Log activity for certificate resending
+                                try:
+                                    course = self.db.get_course_by_course_id(learner.course_id)
+                                    org = self.db.get_organization_by_website(learner.organization_website)
+                                    course_name = course.name if course else "Unknown Course"
+                                    org_name = org.name if org else learner.organization_website
+                                    
+                                    self.activity_log.log_activity(
+                                        activity_type=ActivityType.CERTIFICATE_RESENT,
+                                        actor="SOP User",
+                                        actor_email=auth_context.email,
+                                        actor_role=auth_context.role.value,
+                                        target=learner.name,
+                                        target_email=learner.email,
+                                        organization_website=learner.organization_website,
+                                        course_id=learner.course_id,
+                                        details=f"Certificate resent for {learner.name} ({learner.email}) - Course: {course_name} (Organization-wide resend)",
+                                        status=ActivityStatus.SUCCESS,
+                                        metadata={
+                                            'webhook_event_id': webhook_event_id,
+                                            'organization_name': org_name,
+                                            'organization_wide_resend': True
+                                        }
+                                    )
+                                    logger.info(f"Activity logged: Certificate resent for {learner.email}")
+                                except Exception as e:
+                                    logger.warning(f"Failed to log certificate resent activity: {e}")
+                                
                                 successful_resends += 1
                             else:
                                 logger.error(f"Certificate resend failed for {learner.email}: {cert_result.get('error')}")
