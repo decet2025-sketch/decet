@@ -508,3 +508,117 @@ class AuthService:
                 'ok': False,
                 'error': str(e)
             }
+    
+    def delete_user_by_email(self, email: str, context=None) -> Dict[str, Any]:
+        """Delete user by email from Appwrite Users collection."""
+        try:
+            from appwrite.services.users import Users
+            from appwrite.client import Client
+            
+            if context:
+                context.log(f"Starting user deletion process for email: {email}")
+            
+            # Initialize Appwrite client
+            client = Client()
+            client.set_endpoint(os.getenv('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1'))
+            client.set_project(os.getenv('APPWRITE_PROJECT_ID'))
+            client.set_key(os.getenv('APPWRITE_API_KEY'))
+            
+            if context:
+                context.log(f"Appwrite client initialized - endpoint: {os.getenv('APPWRITE_ENDPOINT', 'https://cloud.appwrite.io/v1')}")
+                context.log(f"Project ID: {os.getenv('APPWRITE_PROJECT_ID')}")
+                context.log(f"API Key: {os.getenv('APPWRITE_API_KEY', '')[:10]}...")
+            
+            # Initialize Users service
+            users = Users(client)
+            
+            if context:
+                context.log("Users service initialized, fetching user list...")
+            
+            # Find user by exact email match using search query
+            try:
+                if context:
+                    context.log(f"Searching for user with email: {email}")
+                
+                # Use search query to find user by email
+                from appwrite.query import Query
+                user_list = users.list(queries=[Query.equal('email', email)])
+                
+                if context:
+                    context.log(f"Search query result - total users: {user_list.get('total', 0)}")
+                
+                if user_list['total'] > 0:
+                    user = user_list['users'][0]  # Get first (and should be only) result
+                    if context:
+                        context.log(f"Found matching user: {user['email']} (ID: {user['$id']})")
+                else:
+                    # Fallback to full list search if query doesn't work
+                    if context:
+                        context.log("Query search failed, falling back to full list search")
+                    
+                    user_list = users.list()
+                    if context:
+                        context.log(f"Full user list fetched - total users: {user_list.get('total', 0)}")
+                    
+                    user = None
+                    if user_list['total'] > 0:
+                        for u in user_list['users']:
+                            if context:
+                                context.log(f"Checking user: {u.get('email', 'no-email')} (ID: {u.get('$id', 'no-id')})")
+                            if u.get('email', '').lower() == email.lower():
+                                user = u
+                                if context:
+                                    context.log(f"Found matching user: {user['email']} (ID: {user['$id']})")
+                                break
+                
+                if not user:
+                    if context:
+                        context.log(f"User with email {email} not found in user list")
+                    return {
+                        'ok': False,
+                        'error': f'User with email {email} not found'
+                    }
+                    
+            except Exception as search_error:
+                if context:
+                    context.log(f"Error searching for user: {str(search_error)}")
+                return {
+                    'ok': False,
+                    'error': f'Error searching for user: {str(search_error)}'
+                }
+            
+            if context:
+                context.log(f"Attempting to delete user {user['email']} with ID: {user['$id']}")
+            
+            # Delete the user
+            try:
+                delete_response = users.delete(user['$id'])
+                if context:
+                    context.log(f"Delete API response: {delete_response}")
+            except Exception as delete_error:
+                if context:
+                    context.log(f"Delete API error: {str(delete_error)}")
+                raise delete_error
+            
+            if context:
+                context.log(f"User deletion API call completed for {email} (ID: {user['$id']})")
+            
+            logger.info(f"User deleted successfully: {email} (ID: {user['$id']})")
+            
+            return {
+                'ok': True,
+                'data': {
+                    'user_id': user['$id'],
+                    'email': user['email'],
+                    'name': user['name']
+                }
+            }
+            
+        except Exception as e:
+            if context:
+                context.log(f"Exception in delete_user_by_email for {email}: {str(e)}")
+            logger.error(f"Error deleting user {email}: {e}")
+            return {
+                'ok': False,
+                'error': str(e)
+            }

@@ -20,14 +20,21 @@ class GraphyService:
 
     def __init__(self, api_base: str, api_key: str, merchant_id: str = None, max_retries: int = 3):
         """Initialize Graphy/Spayee service."""
-        # Default to Spayee API if not specified
+        # Set up both API bases
         if not api_base or api_base == 'https://api.ongraphy.com':
-            self.api_base = 'https://api.spayee.com'
+            self.graphy_api_base = 'https://api.ongraphy.com'  # For learner creation
+            self.spayee_api_base = 'https://api.spayee.com'    # For enrollment
         else:
-            self.api_base = api_base.rstrip('/')
+            self.graphy_api_base = api_base.rstrip('/')
+            self.spayee_api_base = 'https://api.spayee.com'    # Always use Spayee for enrollment
+        
         self.api_key = api_key
         self.merchant_id = merchant_id
         self.max_retries = max_retries
+        
+        # Debug logging
+        logger.info(f"GraphyService initialized - Graphy API: {self.graphy_api_base}, Spayee API: {self.spayee_api_base}")
+        logger.info(f"API Key: {api_key[:10] if api_key else 'None'}..., Merchant ID: {merchant_id}")
         
         # Setup session with retry strategy
         self.session = requests.Session()
@@ -47,9 +54,10 @@ class GraphyService:
             'User-Agent': 'Certificate-Backend/1.0'
         })
 
-    def _make_request(self, method: str, endpoint: str, data: Optional[Dict[str, Any]] = None, use_auth: bool = True) -> Dict[str, Any]:
+    def _make_request(self, method: str, endpoint: str, data: Optional[Dict[str, Any]] = None, use_auth: bool = True, use_spayee: bool = False) -> Dict[str, Any]:
         """Make HTTP request with error handling."""
-        url = f"{self.api_base}{endpoint}"
+        api_base = self.spayee_api_base if use_spayee else self.graphy_api_base
+        url = f"{api_base}{endpoint}"
         
         # Prepare request parameters
         params = {}
@@ -137,67 +145,86 @@ class GraphyService:
                 'status_code': 500
             }
 
-    def enroll_learner(self, request: GraphyEnrollmentRequest) -> GraphyEnrollmentResponse:
+    def enroll_learner(self, request: GraphyEnrollmentRequest, context=None) -> GraphyEnrollmentResponse:
         """
         Enroll a learner in a course using Spayee API.
         
         Based on Spayee API: https://api.spayee.com/public/v1/assign
         """
         try:
-            # Prepare enrollment data for Spayee API
-            enrollment_data = {
-                'mid': self.merchant_id,
-                'key': self.api_key,
-                'email': request.email,
-                'productId': request.course_id,
-                'countryCode': request.metadata.get('countryCode', 'IN') if request.metadata else 'IN',
-                'phone': request.metadata.get('phone', '') if request.metadata else '',
-                'utmSource': request.metadata.get('utmSource', '') if request.metadata else '',
-                'utmContent': request.metadata.get('utmContent', '') if request.metadata else '',
-                'utmTerm': request.metadata.get('utmTerm', '') if request.metadata else '',
-                'utmCampaign': request.metadata.get('utmCampaign', '') if request.metadata else '',
-                'utmMedium': request.metadata.get('utmMedium', '') if request.metadata else '',
-                'eventId': request.metadata.get('eventId', '') if request.metadata else '',
-                'extPG': request.metadata.get('extPG', '') if request.metadata else '',
-                'extPaymentId': request.metadata.get('extPaymentId', '') if request.metadata else ''
-            }
+            # Prepare enrollment data in exact same format as working curl command
+            enrollment_data = f"mid={self.merchant_id}&key={self.api_key}&email={request.email}&productId={request.course_id}&countryCode=IN&utmSource=utmSource&utmContent=utmContent&utmTerm=utmTerm&utmCampaign=utmCampaign&utmMedium=utmMedium&eventId=eventId&extPG=razorpay&extPaymentId=pay_vdjashUbbs&phone=+919999999999"
             
-            # Make API call to Spayee enrollment endpoint
-            url = f"{self.api_base}/public/v1/assign"
+            # Make API call to Spayee enrollment endpoint (hardcoded for testing)
+            url = "https://api.spayee.com/public/v1/assign"
             
-            # Use form-encoded data for Spayee API
+            # Add context logging if available
+            if context:
+                context.log(f"Starting Spayee enrollment for {request.email} in course {request.course_id}")
+                context.log(f"Enrollment URL: {url}")
+                context.log(f"Merchant ID: {self.merchant_id}")
+                context.log(f"API Key: {self.api_key[:10]}...")
+                context.log(f"Enrollment data: {enrollment_data}")
+            
+            logger.info(f"Spayee enrollment data: {enrollment_data}")
+            
+            # Use form-encoded data for Spayee API in exact same format as curl
             response = self.session.post(
                 url,
-                data=enrollment_data,  # Use data instead of json for form-encoded
+                data=enrollment_data,  # Send as raw form data string
+                headers={'Content-Type': 'application/x-www-form-urlencoded'},
                 timeout=30
             )
             
-            logger.info(f"Spayee API POST {url} - Status: {response.status_code}")
+            # Add detailed response logging
+            if context:
+                context.log(f"Spayee API response - Status: {response.status_code}")
+                context.log(f"Spayee API response - Headers: {dict(response.headers)}")
+                context.log(f"Spayee API response - Content: {response.text}")
+            
+            logger.info(f"Spayee API POST {url} - Status: {response.status_code}, Response: {response.text[:200]}")
             
             if response.status_code in [200, 201]:
                 try:
                     response_data = response.json() if response.content else {}
+                    if context:
+                        context.log(f"Parsed response data: {response_data}")
                 except json.JSONDecodeError:
                     response_data = {"raw_response": response.text}
+                    if context:
+                        context.log(f"Failed to parse JSON, using raw response: {response.text}")
                 
                 # Check if enrollment was successful
                 if response_data.get('status') == 'success':
+                    if context:
+                        context.log(f"Enrollment successful for {request.email}")
                     return GraphyEnrollmentResponse(
                         ok=True,
                         enrollment_id=response_data.get('enrollmentId') or response_data.get('id')
                     )
                 else:
+                    error_msg = response_data.get('message', 'Enrollment failed')
+                    if context:
+                        context.log(f"Enrollment failed for {request.email}: {error_msg}")
+                        context.log(f"Full response data: {response_data}")
                     return GraphyEnrollmentResponse(
                         ok=False,
-                        error=response_data.get('message', 'Enrollment failed')
+                        error=error_msg
                     )
             else:
                 error_msg = f"HTTP {response.status_code}"
                 try:
                     error_data = response.json()
                     error_msg = error_data.get('message', error_data.get('error', error_msg))
+                    if context:
+                        context.log(f"HTTP error response: {error_data}")
                 except:
                     error_msg = response.text or error_msg
+                    if context:
+                        context.log(f"HTTP error - raw response: {response.text}")
+                
+                if context:
+                    context.log(f"Enrollment failed with HTTP {response.status_code}: {error_msg}")
                 
                 return GraphyEnrollmentResponse(
                     ok=False,
@@ -205,6 +232,8 @@ class GraphyService:
                 )
                 
         except Exception as e:
+            if context:
+                context.log(f"Exception in enroll_learner for {request.email}: {str(e)}")
             logger.error(f"Error in enroll_learner: {e}")
             return GraphyEnrollmentResponse(
                 ok=False,
@@ -318,6 +347,70 @@ class GraphyService:
                 'error': f"Failed to get learner data: {str(e)}"
             }
 
+    def create_learner(self, email: str, name: str) -> Dict[str, Any]:
+        """Create a learner in Graphy/Spayee."""
+        try:
+            # Use form data for Graphy API
+            form_data = {
+                'mid': self.merchant_id,
+                'key': self.api_key,
+                'email': email,
+                'name': name
+            }
+            
+            url = 'https://api.ongraphy.com/public/v1/learners'
+            logger.info(f"Creating learner in Graphy - URL: {url}, Data: {form_data}")
+            
+            # Make request to create learner using Graphy API
+            response = self.session.post(
+                url,
+                data=form_data,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'},
+                timeout=30
+            )
+            
+            logger.info(f"Graphy create learner response - Status: {response.status_code}, Content: {response.text[:200]}")
+            
+            if response.status_code == 200:
+                result = response.json()
+                
+                # Check if learner was created successfully or already exists
+                if result.get('status') == 'success':
+                    logger.info(f"Learner {email} created successfully in Graphy")
+                    return {
+                        'ok': True,
+                        'data': result,
+                        'message': 'Learner created successfully'
+                    }
+                elif 'error' in result and result['error'].get('code') == 22:
+                    # Learner already exists (code 22)
+                    logger.info(f"Learner {email} already exists in Graphy")
+                    return {
+                        'ok': True,
+                        'data': result,
+                        'message': 'Learner already exists',
+                        'already_exists': True
+                    }
+                else:
+                    logger.error(f"Error creating learner {email}: {result}")
+                    return {
+                        'ok': False,
+                        'error': result.get('error', {}).get('message', 'Unknown error creating learner')
+                    }
+            else:
+                logger.error(f"HTTP {response.status_code} creating learner {email}: {response.text}")
+                return {
+                    'ok': False,
+                    'error': f"HTTP {response.status_code}: {response.text}"
+                }
+                
+        except Exception as e:
+            logger.error(f"Error creating learner {email}: {e}")
+            return {
+                'ok': False,
+                'error': f"Failed to create learner: {str(e)}"
+            }
+
     def get_completion_status(self, product_id: str, email: str) -> Dict[str, Any]:
         """Get course completion status for a learner."""
         try:
@@ -371,7 +464,7 @@ class GraphyService:
         try:
             # Try to get products with limit 1 to test API connectivity
             # Use different endpoints based on API base
-            if 'spayee.com' in self.api_base:
+            if 'spayee.com' in self.spayee_api_base:
                 # For Spayee, we can't easily test without a specific endpoint
                 # Just test basic connectivity
                 result = self._make_request('GET', '/public/v1/products', {'limit': 1})

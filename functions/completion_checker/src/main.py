@@ -543,14 +543,9 @@ def main(context):
         # Handle different actions
         action = request_data.get('action', 'process_batch')
         context.log(f"Processing action: {action}")
+
         
-        if action == 'health':
-            context.log("Executing health check...")
-            result = checker.health_check()
-            context.log(f"Health check result: {result}")
-            return context.res.json(result)
-        
-        elif action == 'process_batch':
+        if action == 'health' or action == 'process_batch':
             batch_size = request_data.get('batch_size', 50)
             context.log(f"Executing process_batch with batch_size: {batch_size}")
             result = checker.process_batch(batch_size)

@@ -155,7 +155,7 @@ class AppwriteClient:
             data_queries = filter_queries + [
                 Query.limit(limit),
                 Query.offset(offset),
-                Query.order_desc('$createdAt')
+                Query.order_desc('$updatedAt')
             ]
             
             result = self.databases.list_documents(
@@ -194,7 +194,7 @@ class AppwriteClient:
             data_queries = filter_queries + [
                 Query.limit(limit),
                 Query.offset(offset),
-                Query.order_desc('$createdAt')
+                Query.order_desc('$updatedAt')
             ]
             
             result = self.databases.list_documents(
@@ -478,7 +478,7 @@ class AppwriteClient:
                 Query.equal('organization_website', organization_website),
                 Query.limit(1000),  # Get more to account for client-side filtering
                 Query.offset(0),    # Reset offset for client-side filtering
-                Query.order_desc('$createdAt')
+                Query.order_desc('$updatedAt')
             ]
             
             # Get all learners for organization first (no search filter at database level)
@@ -518,7 +518,7 @@ class AppwriteClient:
                 Query.equal('course_id', course_id),
                 Query.limit(1000),  # Get more to account for client-side filtering
                 Query.offset(0),    # Reset offset for client-side filtering
-                Query.order_desc('$createdAt')
+                Query.order_desc('$updatedAt')
             ]
             
             # Get all learners for course first (no search filter at database level)
@@ -557,7 +557,7 @@ class AppwriteClient:
             queries = [
                 Query.limit(limit),
                 Query.offset(offset),
-                Query.order_desc('$createdAt')
+                Query.order_desc('$updatedAt')
             ]
             
             # Add search functionality
@@ -634,7 +634,7 @@ class AppwriteClient:
             queries = [
                 Query.limit(limit),
                 Query.offset(offset),
-                Query.order_desc('$createdAt')
+                Query.order_desc('$updatedAt')
             ]
             
             if status:

@@ -488,7 +488,10 @@ class AdminRouter:
                 }
             
             # Execute handler
-            return handler(action_request.payload, auth_context)
+            if action_request.action in [ActionType.UPLOAD_LEARNERS_CSV_DIRECT, ActionType.DELETE_ORGANIZATION]:
+                return handler(action_request.payload, auth_context, context)
+            else:
+                return handler(action_request.payload, auth_context)
             
         except Exception as e:
             import traceback
@@ -792,15 +795,17 @@ class AdminRouter:
                 }
             }
 
-    def _handle_upload_learners_csv_direct(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+    def _handle_upload_learners_csv_direct(self, payload: Dict[str, Any], auth_context, context) -> Dict[str, Any]:
         """Handle UPLOAD_LEARNERS_CSV_DIRECT action."""
         try:
             # Validate payload
             upload_data = UploadLearnersCSVDirectPayload(**payload)
+            context.log(f"Processing CSV upload for course_id: {upload_data.course_id}")
             
             # Check if course exists
             course = self.db.get_course_by_course_id(upload_data.course_id)
             if not course:
+                context.log(f"Course not found: {upload_data.course_id}")
                 return {
                     'ok': False,
                     'status': 404,
@@ -810,11 +815,17 @@ class AdminRouter:
                     }
                 }
             
+            context.log(f"Course found: {course.name} (ID: {course.course_id})")
+            
             # Parse and validate CSV
+            context.log(f"Parsing CSV data: {upload_data.csv_data}")
             validation_result = self._parse_and_validate_csv_direct(upload_data.csv_data, upload_data.course_id)
+            context.log(f"CSV validation result - Valid: {len(validation_result.valid_rows)}, Invalid: {len(validation_result.invalid_rows)}, Duplicates: {len(validation_result.duplicate_rows)}")
             
             # Process valid rows
-            upload_result = self._process_learner_enrollments(validation_result, upload_data.course_id)
+            context.log(f"Processing {len(validation_result.valid_rows)} valid learner enrollments")
+            upload_result = self._process_learner_enrollments(validation_result, upload_data.course_id, context)
+            context.log(f"Upload result - Created: {upload_result.created_learners}, Enrolled: {upload_result.enrollment_success}, Failed: {upload_result.enrollment_failed}")
             
             # Log activity (with error handling to not break main functionality)
             try:
@@ -862,7 +873,6 @@ class AdminRouter:
         valid_rows = []
         invalid_rows = []
         duplicate_rows = []
-        seen_emails = set()
         
         try:
             # Parse CSV
@@ -896,15 +906,7 @@ class AdminRouter:
                 if email and '@' not in email:
                     errors.append('Invalid email format')
                 
-                # Check for duplicates within CSV
-                if email in seen_emails:
-                    duplicate_rows.append({
-                        'row_number': row_num,
-                        'row_data': row,
-                        'errors': ['Duplicate email in CSV']
-                    })
-                    continue
-                seen_emails.add(email)
+                # No duplicate checks - allow all valid entries
                 
                 # Check if organization exists
                 org_website = row.get('organization_website', '').strip()
@@ -962,7 +964,6 @@ class AdminRouter:
         valid_rows = []
         invalid_rows = []
         duplicate_rows = []
-        seen_emails = set()
         
         try:
             # Parse CSV
@@ -999,17 +1000,6 @@ class AdminRouter:
                     })
                     continue
                 
-                # Check for duplicates
-                email = row['email'].strip().lower()
-                if email in seen_emails:
-                    duplicate_rows.append({
-                        'row_number': row_num,
-                        'row_data': row
-                    })
-                    continue
-                
-                seen_emails.add(email)
-                
                 # Create learner row
                 try:
                     learner_row = LearnerCSVRow(
@@ -1043,7 +1033,7 @@ class AdminRouter:
                 duplicate_rows=[]
             )
 
-    def _process_learner_enrollments(self, validation_result: CSVValidationResult, course_id: str) -> UploadResult:
+    def _process_learner_enrollments(self, validation_result: CSVValidationResult, course_id: str, context) -> UploadResult:
         """Process learner enrollments."""
         created_learners = 0
         enrollment_success = 0
@@ -1051,8 +1041,10 @@ class AdminRouter:
         enrollment_errors = []
         
         for learner_row in validation_result.valid_rows:
+            context.log(f"Processing enrollment of learner: {learner_row.email}, website: {learner_row.organization_website} in Graphy")
             try:
                 # Create learner record
+                context.log(f"Creating learner record for {learner_row.email}")
                 learner = self.db.create_learner_if_not_exists({
                     'name': learner_row.name,
                     'email': learner_row.email,
@@ -1061,9 +1053,42 @@ class AdminRouter:
                 })
                 
                 if learner:
+                    context.log(f"Learner record created/found for {learner_row.email}, ID: {learner.id}")
                     created_learners += 1
                     
-                    # Enroll in Graphy
+                    # First, create learner in Graphy if they don't exist
+                    context.log(f"Creating learner {learner_row.email} in Graphy")
+                    create_response = self.graphy.create_learner(learner_row.email, learner_row.name)
+                    context.log(f"Graphy create learner response for {learner_row.email}: {create_response}")
+                    
+                    if not create_response.get('ok'):
+                        # If learner creation fails, mark enrollment as failed
+                        error_msg = create_response.get('error', 'Unknown error')
+                        context.log(f"Failed to create learner {learner_row.email} in Graphy: {error_msg}")
+                        try:
+                            self.db.update_learner(learner.id, {
+                                'enrollment_error': f"Graphy learner creation failed: {error_msg}"
+                            })
+                        except Exception as update_error:
+                            context.log(f"Failed to update learner with error: {update_error}")
+                        enrollment_failed += 1
+                        enrollment_errors.append(EnrollmentResult(
+                            learner_email=learner_row.email,
+                            success=False,
+                            error=f"Graphy learner creation failed: {error_msg}"
+                        ))
+                        continue
+                    
+                    # Proceed with enrollment regardless of whether learner was newly created or already existed
+                    
+                    # Log learner creation status
+                    if create_response.get('already_exists'):
+                        context.log(f"Learner {learner_row.email} already exists in Graphy")
+                    else:
+                        context.log(f"Learner {learner_row.email} created successfully in Graphy")
+                    
+                    # Now enroll in Graphy
+                    context.log(f"Starting enrollment for {learner_row.email} in course {course_id}")
                     enrollment_request = GraphyEnrollmentRequest(
                         course_id=course_id,
                         email=learner_row.email,
@@ -1073,28 +1098,48 @@ class AdminRouter:
                         }
                     )
                     
-                    enrollment_response = self.graphy.enroll_learner(enrollment_request)
+                    context.log(f"Enrollment request for {learner_row.email}: course_id={course_id}, email={learner_row.email}, name={learner_row.name}")
+                    enrollment_response = self.graphy.enroll_learner(enrollment_request, context)
+                    context.log(f"Enrollment response for {learner_row.email}: ok={enrollment_response.ok}, error={enrollment_response.error}")
                     
                     if enrollment_response.ok:
                         # Update learner with enrollment details
-                        self.db.update_learner(learner.id, {
-                            'enrollment_status': 'enrolled'
-                        })
+                        context.log(f"Enrollment successful for {learner_row.email}, updating database")
+                        try:
+                            self.db.update_learner(learner.id, {
+                                'enrollment_status': 'enrolled'
+                            })
+                            context.log(f"Database updated successfully for {learner_row.email}")
+                        except Exception as update_error:
+                            context.log(f"Failed to update learner enrollment status: {update_error}")
                         enrollment_success += 1
                     else:
                         # Mark enrollment failed
-                        self.db.update_learner(learner.id, {
-                            'enrollment_error': enrollment_response.error
-                        })
+                        error_msg = enrollment_response.error or 'Unknown enrollment error'
+                        context.log(f"Enrollment failed for {learner_row.email}: {error_msg}")
+                        try:
+                            self.db.update_learner(learner.id, {
+                                'enrollment_error': error_msg
+                            })
+                        except Exception as update_error:
+                            context.log(f"Failed to update learner with enrollment error: {update_error}")
                         enrollment_failed += 1
                         enrollment_errors.append(EnrollmentResult(
                             learner_email=learner_row.email,
                             success=False,
-                            error=enrollment_response.error
+                            error=error_msg
                         ))
+                else:
+                    context.log(f"Failed to create/find learner record for {learner_row.email}")
+                    enrollment_failed += 1
+                    enrollment_errors.append(EnrollmentResult(
+                        learner_email=learner_row.email,
+                        success=False,
+                        error="Failed to create learner record"
+                    ))
                 
             except Exception as e:
-                logger.error(f"Error processing learner {learner_row.email}: {e}")
+                context.log(f"Exception processing learner {learner_row.email}: {str(e)}")
                 enrollment_failed += 1
                 enrollment_errors.append(EnrollmentResult(
                     learner_email=learner_row.email,
@@ -1696,7 +1741,7 @@ class AdminRouter:
                 }
             }
 
-    def _handle_delete_organization(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+    def _handle_delete_organization(self, payload: Dict[str, Any], auth_context, context=None) -> Dict[str, Any]:
         """Handle DELETE_ORGANIZATION action."""
         try:
             # Validate payload
@@ -1727,6 +1772,20 @@ class AdminRouter:
                     }
                 }
             
+            # Delete associated auth user (with error handling to not break main flow)
+            auth_user_deleted = False
+            try:
+                logger.info(f"Attempting to delete auth user for organization SOP email: {existing_org.sop_email}")
+                auth_result = self.auth.delete_user_by_email(existing_org.sop_email, context)
+                if auth_result['ok']:
+                    auth_user_deleted = True
+                    logger.info(f"Auth user deleted successfully: {existing_org.sop_email}")
+                else:
+                    logger.warning(f"Failed to delete auth user {existing_org.sop_email}: {auth_result.get('error', 'Unknown error')}")
+            except Exception as auth_error:
+                logger.error(f"Error deleting auth user {existing_org.sop_email}: {auth_error}")
+                # Don't fail the entire operation if auth user deletion fails
+            
             # Log activity (with error handling to not break main functionality)
             try:
                 self.activity_log.log_activity(
@@ -1739,7 +1798,8 @@ class AdminRouter:
                     details=f"Organization {existing_org.name or existing_org.website} deleted",
                     status=ActivityStatus.SUCCESS,
                     metadata={
-                        'sop_email': existing_org.sop_email
+                        'sop_email': existing_org.sop_email,
+                        'auth_user_deleted': auth_user_deleted
                     }
                 )
             except Exception as log_error:
@@ -1749,7 +1809,9 @@ class AdminRouter:
                 'ok': True,
                 'status': 200,
                 'data': {
-                    'message': f'Organization {org_data.website} deleted successfully'
+                    'message': f'Organization {org_data.website} deleted successfully',
+                    'auth_user_deleted': auth_user_deleted,
+                    'sop_email': existing_org.sop_email
                 }
             }
             
