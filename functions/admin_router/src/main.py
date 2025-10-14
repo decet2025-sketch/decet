@@ -285,15 +285,32 @@ class AdminRouter:
                 
                 # Get user by email to verify they exist and get their details
                 users = Users(self.db.client)
-                user_list = users.list()
                 
-                # Find exact email match
-                user = None
-                if user_list['total'] > 0:
-                    for u in user_list['users']:
-                        if u.get('email', '').lower() == email.lower():
-                            user = u
-                            break
+                # Use improved query method to find user by email
+                try:
+                    from appwrite.query import Query
+                    user_list = users.list(queries=[Query.equal('email', email)])
+                    
+                    if user_list['total'] > 0:
+                        user = user_list['users'][0]  # Get first (and should be only) result
+                    else:
+                        # Fallback to full list search if query doesn't work
+                        user_list = users.list()
+                        user = None
+                        if user_list['total'] > 0:
+                            for u in user_list['users']:
+                                if u.get('email', '').lower() == email.lower():
+                                    user = u
+                                    break
+                except Exception as search_error:
+                    # If query fails, fall back to full list search
+                    user_list = users.list()
+                    user = None
+                    if user_list['total'] > 0:
+                        for u in user_list['users']:
+                            if u.get('email', '').lower() == email.lower():
+                                user = u
+                                break
                 
                 if not user:
                     return {
