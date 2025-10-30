@@ -222,7 +222,8 @@ class CertificateWorker:
             
             # Get organization
             org = self.db.get_organization_by_website(learner.organization_website)
-            if not org:
+            orgs = self.db.get_all_organization_by_website(learner.organization_website)
+            if not orgs:
                 return {
                     'ok': False,
                     'status': 404,
@@ -239,7 +240,7 @@ class CertificateWorker:
             
             # Send email to SOP with PDF bytes or HTML content
             email_result = self._send_certificate_email(
-                course, learner, org, 
+                course, learner, org, orgs,
                 pdf_result.get('pdf_bytes'), 
                 pdf_result.get('filename'),
                 pdf_result.get('html_content')
@@ -432,37 +433,43 @@ class CertificateWorker:
                 }
             }
 
-    def _send_certificate_email(self, course, learner, org, pdf_bytes: Optional[bytes], filename: Optional[str], html_content: Optional[str] = None) -> Dict[str, Any]:
+    def _send_certificate_email(self, course, learner, org, orgs, pdf_bytes: Optional[bytes], filename: Optional[str], html_content: Optional[str] = None) -> Dict[str, Any]:
         """Send certificate email to SOP with PDF bytes or HTML content."""
         try:
             if pdf_bytes and filename:
                 logger.info(f"Sending certificate email to {org.sop_email} with PDF attachment")
                 
                 # Send email with PDF bytes directly
-                email_response = self.email.send_certificate_email(
-                    to_email=org.sop_email,
-                    learner_name=learner.name,
-                    learner_email=learner.email,
-                    course_name=course.name,
-                    organization_name=org.name or org.website,
-                    attachment_content=pdf_bytes,
-                    attachment_filename=filename
-                )
+                resp = None
+                for org1 in orgs:
+                    email_response = self.email.send_certificate_email(
+                        to_email=org1.sop_email,
+                        learner_name=learner.name,
+                        learner_email=learner.email,
+                        course_name=course.name,
+                        organization_name=org1.name or org1.website,
+                        attachment_content=pdf_bytes,
+                        attachment_filename=filename
+                    )
+                    resp = email_response
+                return resp.dict()
             else:
                 logger.info(f"Sending certificate email to {org.sop_email} with HTML content (PDF generation failed)")
                 
                 # Send email with HTML content instead of PDF
-                email_response = self.email.send_certificate_email_html(
-                    to_email=org.sop_email,
-                    learner_name=learner.name,
-                    learner_email=learner.email,
-                    course_name=course.name,
-                    organization_name=org.name or org.website,
-                    html_content=html_content
-                )
-            
-            logger.info(f"Email response: {email_response}")
-            return email_response.dict()
+                resp = None
+                for org1 in orgs:
+                    email_response = self.email.send_certificate_email_html(
+                        to_email=org1.sop_email,
+                        learner_name=learner.name,
+                        learner_email=learner.email,
+                        course_name=course.name,
+                        organization_name=org1.name or org1.website,
+                        html_content=html_content
+                    )
+                    resp = email_response
+                    logger.info(f"Email response: {email_response}")
+                return resp.dict()
             
         except Exception as e:
             logger.error(f"Error sending certificate email: {e}")

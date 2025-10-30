@@ -227,6 +227,47 @@ class AppwriteClient:
             logger.error(f"Error getting organization {website}: {e}")
             return None
 
+    def get_all_organization_by_website(self, website: str) -> List[OrganizationModel]:
+        """Get organization by website."""
+        try:
+            result = self.databases.list_documents(
+                database_id='main',
+                collection_id='organizations',
+                queries=[Query.equal('website', website)]
+            )
+
+            organizations = []
+            if result['documents']:
+                for doc in result['documents']:
+                    org = self._convert_document_to_model(doc, OrganizationModel)
+                    if org:
+                        organizations.append(org)
+            return organizations
+        except Exception as e:
+            logger.error(f"Error getting organization {website}: {e}")
+            return None
+
+    def get_organizations_by_website_and_sop_email(self, website: str, sop_email: str) -> List[OrganizationModel]:
+        """Get organizations by website and sop_email."""
+        try:
+            result = self.databases.list_documents(
+                database_id='main',
+                collection_id='organizations',
+                queries=[Query.equal('website', website),
+                         Query.equal('sop_email', sop_email)]
+            )
+
+            organizations = []
+            if result['documents']:
+                for doc in result['documents']:
+                    org = self._convert_document_to_model(doc, OrganizationModel)
+                    if org:
+                        organizations.append(org)
+            return organizations
+        except Exception as e:
+            logger.error(f"Error getting organizations for {website} and {sop_email}: {e}")
+            return []
+
     def get_organization_by_id(self, organization_id: str) -> Optional[OrganizationModel]:
         """Get organization by ID."""
         try:

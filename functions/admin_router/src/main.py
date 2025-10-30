@@ -28,7 +28,7 @@ from shared.models import (
     CertificateContext, LearnerCSVRow, GraphyEnrollmentRequest,
     ListActivityLogsPayload, ActivityType, ActivityStatus,
     LearnerStatisticsPayload, OrganizationStatisticsPayload, CourseStatisticsPayload,
-    LearnerModel
+    LearnerModel, UpdateLearnerPayload
 )
 from shared.services.db import AppwriteClient
 from shared.services.graphy import GraphyService
@@ -349,8 +349,17 @@ class AdminRouter:
                     }
                 
                 # Get organization details
-                organization = self.db.get_organization_by_website(organization_website)
-                if not organization:
+                #organization = self.db.get_organization_by_website(organization_website)
+                organizations = self.db.get_organizations_by_website_and_sop_email(organization_website, sop_email=email)
+
+                isOrg = False
+                actual_org = None
+                for org in organizations:
+                    if org.sop_email == email:
+                        actual_org = org
+                        isOrg = True
+                        break
+                if not organizations:
                     return {
                         'ok': False,
                         'status': 404,
@@ -361,7 +370,7 @@ class AdminRouter:
                     }
                 
                 # Validate that the user's email matches the organization's sop_email
-                if organization.sop_email != email:
+                if not isOrg:
                     return {
                         'ok': False,
                         'status': 403,
@@ -403,12 +412,12 @@ class AdminRouter:
                         'token': token,
                         'message': 'SOP user login successful',
                         'organization': {
-                            'id': organization.id,
-                            'website': organization.website,
-                            'name': organization.name,
-                            'sop_email': organization.sop_email,
-                            'created_at': organization.created_at.isoformat() if organization.created_at else None,
-                            'updated_at': organization.updated_at.isoformat() if organization.updated_at else None
+                            'id': actual_org.id,
+                            'website': actual_org.website,
+                            'name': actual_org.name,
+                            'sop_email': actual_org.sop_email,
+                            'created_at': actual_org.created_at.isoformat() if actual_org.created_at else None,
+                            'updated_at': actual_org.updated_at.isoformat() if actual_org.updated_at else None
                         }
                     }
                 }
@@ -490,6 +499,7 @@ class AdminRouter:
                 ActionType.LEARNER_STATISTICS: self._handle_learner_statistics,
                 ActionType.ORGANIZATION_STATISTICS: self._handle_organization_statistics,
                 ActionType.COURSE_STATISTICS: self._handle_course_statistics,
+                ActionType.UPDATE_LEARNER: self._handle_update_learner,
             }
             
             handler = handler_map.get(action_request.action)
@@ -1520,14 +1530,14 @@ class AdminRouter:
             org_data = AddOrganizationPayload(**payload)
             
             # Check if organization already exists
-            existing_org = self.db.get_organization_by_website(org_data.website)
+            existing_org = self.db.get_organizations_by_website_and_sop_email(org_data.website, org_data.sop_email)
             if existing_org:
                 return {
                     'ok': False,
                     'status': 409,
                     'error': {
                         'code': 'ORGANIZATION_EXISTS',
-                        'message': f'Organization with website {org_data.website} already exists'
+                        'message': f'Organization with website {org_data.website} and poc email {org_data.sop_email} already exists'
                     }
                 }
             
@@ -1575,7 +1585,8 @@ class AdminRouter:
             org = self.db.create_organization({
                 'website': org_data.website,
                 'name': org_data.name,
-                'sop_email': org_data.sop_email
+                'sop_email': org_data.sop_email,
+                'password': org_data.sop_password
             })
             
             if not org:
@@ -1970,6 +1981,56 @@ class AdminRouter:
                 'error': {
                     'code': 'INTERNAL_ERROR',
                     'message': f'Internal server error: {str(e)}'
+                }
+            }
+
+    def _handle_update_learner(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+        """Handle UPDATE_LEARNER action: update learner fields by email within an organization."""
+        try:
+            if not self.auth.require_admin(auth_context):
+                return self.auth.create_unauthorized_response()
+
+            data = UpdateLearnerPayload(**payload)
+
+            update_data = {}
+            if data.name is not None:
+                update_data['name'] = data.name
+            if data.email is not None:
+                update_data['email'] = str(data.email)
+
+            if not update_data:
+                return {
+                    'ok': False,
+                    'status': 400,
+                    'error': {
+                        'code': 'NO_FIELDS_TO_UPDATE',
+                        'message': 'Provide at least one field to update (name or email)'
+                    }
+                }
+
+            learners = self.db.query_learners_for_org(data.organization_website, limit=10000, offset=0)
+            updated = 0
+            for learner in learners:
+                if learner.email.lower() == str(data.learner_email).lower():
+                    res = self.db.update_learner(learner.id, update_data)
+                    if res:
+                        updated += 1
+
+            return {
+                'ok': True,
+                'status': 200,
+                'data': {
+                    'updated_count': updated
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error updating learner: {e}")
+            return {
+                'ok': False,
+                'status': 500,
+                'error': {
+                    'code': 'UPDATE_LEARNER_FAILED',
+                    'message': str(e)
                 }
             }
 

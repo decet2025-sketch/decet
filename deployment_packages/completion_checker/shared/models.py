@@ -32,6 +32,7 @@ class ActionType(str, Enum):
     ORGANIZATION_STATISTICS = "ORGANIZATION_STATISTICS"
     COURSE_STATISTICS = "COURSE_STATISTICS"
     DOWNLOAD_CERTIFICATE = "DOWNLOAD_CERTIFICATE"
+    UPDATE_LEARNER = "UPDATE_LEARNER"
 
 
 class SOPActionType(str, Enum):
@@ -228,6 +229,13 @@ class UploadLearnersCSVDirectPayload(BaseModel):
     csv_data: str = Field(..., min_length=1)  # CSV content as string
 
 
+class UpdateLearnerPayload(BaseModel):
+    """Payload for updating a learner across an organization."""
+    learner_email: EmailStr
+    organization_website: str = Field(..., min_length=1, max_length=255)
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    email: Optional[EmailStr] = None
+
 class CSVValidationResult(BaseModel):
     """Result of CSV validation."""
     valid_rows: List[LearnerCSVRow]
@@ -321,7 +329,7 @@ class OrganizationModel(BaseModel):
     sop_email: EmailStr
     created_at: datetime
     updated_at: datetime
-
+    password: Optional[str] = None
 
 class LearnerModel(BaseModel):
     """Learner database model."""

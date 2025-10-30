@@ -364,10 +364,10 @@ class TestCertificateWorker:
         }
         
         # Mock email sending
-        certificate_worker._send_certificate_email.return_value = {
-            'ok': True,
-            'message_id': 'msg-123'
-        }
+        # certificate_worker._send_certificate_email.return_value = {
+        #     'ok': True,
+        #     'message_id': 'msg-123'
+        # }
         
         response = certificate_worker.process_webhook_event("webhook-123")
         
