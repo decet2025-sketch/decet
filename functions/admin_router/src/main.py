@@ -2017,6 +2017,8 @@ class AdminRouter:
                 update_data['name'] = data.name
             if data.email is not None:
                 update_data['email'] = str(data.email)
+            if data.new_website is not None:
+                update_data['organization_website'] = str(data.new_website)
 
             if not update_data:
                 return {

@@ -238,6 +238,7 @@ class UpdateLearnerPayload(BaseModel):
     organization_website: str = Field(..., min_length=1, max_length=255)
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     email: Optional[EmailStr] = None
+    new_website: str = Field(..., min_length=1, max_length=255)
 
 
 class DeleteLearnerPayload(BaseModel):
