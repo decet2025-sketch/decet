@@ -423,6 +423,19 @@ class AppwriteClient:
             logger.error(f"Error updating learner {learner_id}: {e}")
             return None
 
+    def delete_learner(self, learner_id: str) -> bool:
+        """Delete learner by ID."""
+        try:
+            self.databases.delete_document(
+                database_id='main',
+                collection_id='learners',
+                document_id=learner_id
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting learner {learner_id}: {e}")
+            return False
+
     def update_learners_organization_website(self, old_website: str, new_website: str) -> int:
         """Update all learners' organization_website from old to new."""
         try:

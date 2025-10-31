@@ -28,7 +28,7 @@ from shared.models import (
     CertificateContext, LearnerCSVRow, GraphyEnrollmentRequest,
     ListActivityLogsPayload, ActivityType, ActivityStatus,
     LearnerStatisticsPayload, OrganizationStatisticsPayload, CourseStatisticsPayload,
-    LearnerModel, UpdateLearnerPayload
+    LearnerModel, UpdateLearnerPayload, DeleteLearnerPayload
 )
 from shared.services.db import AppwriteClient
 from shared.services.graphy import GraphyService
@@ -500,6 +500,8 @@ class AdminRouter:
                 ActionType.ORGANIZATION_STATISTICS: self._handle_organization_statistics,
                 ActionType.COURSE_STATISTICS: self._handle_course_statistics,
                 ActionType.UPDATE_LEARNER: self._handle_update_learner,
+                ActionType.DELETE_LEARNER: self._handle_delete_learner,
+                ActionType.VALIDATE_CSV_ORGANIZATION_CONFLICTS: self._handle_validate_csv_organization_conflicts,
             }
             
             handler = handler_map.get(action_request.action)
@@ -1366,7 +1368,7 @@ class AdminRouter:
                     queries = [
                         Query.limit(1000),
                         Query.offset(0),
-                        Query.order_desc('$createdAt')
+                        Query.order_desc('$updatedAt')
                     ]
                     
                     # Get all learners first (no search filter at database level for wildcard search)
@@ -1396,7 +1398,7 @@ class AdminRouter:
                     logger.error(f"Error getting learners from database: {e}")
                     all_learners = []
             
-            # Group learners by email
+            # Group learners by email and track latest learner updated_at for sorting
             learner_groups = {}
             for learner in all_learners:
                 email = learner.email
@@ -1408,8 +1410,15 @@ class AdminRouter:
                             'organization_website': learner.organization_website
                         },
                         'organization_info': None,  # Will be populated below
-                        'courses': []
+                        'courses': [],
+                        '_latest_updated_at': getattr(learner, 'updated_at', None)
                     }
+                else:
+                    # Update latest updated_at if this learner record is newer
+                    existing_dt = learner_groups[email].get('_latest_updated_at')
+                    curr_dt = getattr(learner, 'updated_at', None)
+                    if curr_dt and (existing_dt is None or curr_dt > existing_dt):
+                        learner_groups[email]['_latest_updated_at'] = curr_dt
                 
                 # Get course information
                 course = self.db.get_course_by_course_id(learner.course_id)
@@ -1477,8 +1486,14 @@ class AdminRouter:
                 group['courses'].sort(key=lambda x: x['created_at'] or '1900-01-01T00:00:00', reverse=True)
                 grouped_learners.append(group)
             
-            # Sort learners by name
-            grouped_learners.sort(key=lambda x: x['learner_info']['name'])
+            # Sort learners by latest learner updated_at desc; fallback to name if missing
+            grouped_learners.sort(
+                key=lambda x: (
+                    x.get('_latest_updated_at') or datetime.min,
+                    x['learner_info']['name']
+                ),
+                reverse=True
+            )
             
             # Apply pagination to grouped results
             start_idx = list_data.offset
@@ -1492,6 +1507,11 @@ class AdminRouter:
             completed_courses = sum(len([c for c in l['courses'] if c['enrollment_status'] == 'completed']) for l in grouped_learners)
             completion_rate = round((completed_courses / total_enrollments * 100) if total_enrollments > 0 else 0, 1)
             
+            # Remove internal fields before returning
+            for g in grouped_learners:
+                if '_latest_updated_at' in g:
+                    del g['_latest_updated_at']
+
             return {
                 'ok': True,
                 'status': 200,
@@ -2030,6 +2050,152 @@ class AdminRouter:
                 'status': 500,
                 'error': {
                     'code': 'UPDATE_LEARNER_FAILED',
+                    'message': str(e)
+                }
+            }
+
+    def _handle_delete_learner(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+        """Handle DELETE_LEARNER action: delete all learner records by email within an organization."""
+        try:
+            if not self.auth.require_admin(auth_context):
+                return self.auth.create_unauthorized_response()
+
+            data = DeleteLearnerPayload(**payload)
+
+            # Get all learners for the organization
+            learners = self.db.query_learners_for_org(data.organization_website, limit=10000, offset=0)
+            
+            # Find and delete all learners matching the email
+            deleted_count = 0
+            for learner in learners:
+                if learner.email.lower() == str(data.learner_email).lower():
+                    success = self.db.delete_learner(learner.id)
+                    if success:
+                        deleted_count += 1
+
+            if deleted_count == 0:
+                return {
+                    'ok': False,
+                    'status': 404,
+                    'error': {
+                        'code': 'LEARNER_NOT_FOUND',
+                        'message': f'No learners found with email {data.learner_email} in organization {data.organization_website}'
+                    }
+                }
+
+            # Log activity
+            try:
+                self.activity_log.log_activity(
+                    activity_type=ActivityType.LEARNER_DELETED,
+                    actor="Admin User",
+                    actor_email=auth_context.email if hasattr(auth_context, 'email') else None,
+                    actor_role=auth_context.role.value,
+                    target_email=data.learner_email,
+                    organization_website=data.organization_website,
+                    details=f"Deleted {deleted_count} learner record(s) for {data.learner_email} from organization {data.organization_website}",
+                    status=ActivityStatus.SUCCESS,
+                    metadata={
+                        'learner_email': str(data.learner_email),
+                        'organization_website': data.organization_website,
+                        'deleted_count': deleted_count
+                    }
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log learner deletion activity: {log_error}")
+
+            return {
+                'ok': True,
+                'status': 200,
+                'data': {
+                    'deleted_count': deleted_count,
+                    'message': f'Successfully deleted {deleted_count} learner record(s) for {data.learner_email}'
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error deleting learner: {e}")
+            return {
+                'ok': False,
+                'status': 500,
+                'error': {
+                    'code': 'DELETE_LEARNER_FAILED',
+                    'message': str(e)
+                }
+            }
+
+    def _handle_validate_csv_organization_conflicts(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+        """Handle VALIDATE_CSV_ORGANIZATION_CONFLICTS action: Check for learners already enrolled in same course under different organization."""
+        try:
+            if not self.auth.require_admin(auth_context):
+                return self.auth.create_unauthorized_response()
+
+            # Validate payload
+            upload_data = UploadLearnersCSVDirectPayload(**payload)
+            course_id = upload_data.course_id
+            csv_data = upload_data.csv_data
+
+            # Parse CSV
+            conflicts = []
+            try:
+                csv_reader = csv.DictReader(io.StringIO(csv_data))
+                
+                for row_num, row in enumerate(csv_reader, start=2):  # Start at 2 (header is row 1)
+                    email = row.get('email', '').strip()
+                    csv_organization_website = row.get('organization_website', '').strip()
+                    
+                    if not email or not csv_organization_website:
+                        continue
+                    
+                    # Normalize organization websites for comparison (remove trailing slashes)
+                    csv_org_normalized = csv_organization_website.rstrip('/')
+                    
+                    # Check if learner exists in the same course (try both original and lowercase email)
+                    existing_learner = self.db.get_learner_by_course_and_email(course_id, email)
+                    if not existing_learner:
+                        existing_learner = self.db.get_learner_by_course_and_email(course_id, email.lower())
+                    
+                    if existing_learner:
+                        # Check if the organization is different (normalize both for comparison)
+                        existing_org_website = existing_learner.organization_website
+                        existing_org_normalized = existing_org_website.rstrip('/') if existing_org_website else ''
+                        
+                        if existing_org_website and existing_org_normalized != csv_org_normalized:
+                            conflicts.append({
+                                'email': email,
+                                'csv_organization_website': csv_organization_website,
+                                'existing_organization_website': existing_org_website,
+                                'row_number': row_num,
+                                'name': row.get('name', '').strip()
+                            })
+                
+            except Exception as parse_error:
+                logger.error(f"Error parsing CSV for conflict validation: {parse_error}")
+                return {
+                    'ok': False,
+                    'status': 400,
+                    'error': {
+                        'code': 'CSV_PARSE_ERROR',
+                        'message': f'Failed to parse CSV: {str(parse_error)}'
+                    }
+                }
+
+            return {
+                'ok': True,
+                'status': 200,
+                'data': {
+                    'conflicts': conflicts,
+                    'conflict_count': len(conflicts),
+                    'conflict_emails': [c['email'] for c in conflicts],
+                    'has_conflicts': len(conflicts) > 0
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error validating CSV organization conflicts: {e}")
+            return {
+                'ok': False,
+                'status': 500,
+                'error': {
+                    'code': 'VALIDATION_ERROR',
                     'message': str(e)
                 }
             }

@@ -33,6 +33,8 @@ class ActionType(str, Enum):
     COURSE_STATISTICS = "COURSE_STATISTICS"
     DOWNLOAD_CERTIFICATE = "DOWNLOAD_CERTIFICATE"
     UPDATE_LEARNER = "UPDATE_LEARNER"
+    DELETE_LEARNER = "DELETE_LEARNER"
+    VALIDATE_CSV_ORGANIZATION_CONFLICTS = "VALIDATE_CSV_ORGANIZATION_CONFLICTS"
 
 
 class SOPActionType(str, Enum):
@@ -77,6 +79,7 @@ class ActivityType(str, Enum):
     COMPLETION_CHECKED = "Completion Checked"
     USER_CREATED = "User Created"
     USER_LOGIN = "User Login"
+    LEARNER_DELETED = "Learner Deleted"
 
 
 class ActivityStatus(str, Enum):
@@ -235,6 +238,13 @@ class UpdateLearnerPayload(BaseModel):
     organization_website: str = Field(..., min_length=1, max_length=255)
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     email: Optional[EmailStr] = None
+
+
+class DeleteLearnerPayload(BaseModel):
+    """Payload for deleting a learner from an organization."""
+    learner_email: EmailStr
+    organization_website: str = Field(..., min_length=1, max_length=255)
+
 
 class CSVValidationResult(BaseModel):
     """Result of CSV validation."""
