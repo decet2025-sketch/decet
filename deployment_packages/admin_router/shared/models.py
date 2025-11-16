@@ -10,6 +10,7 @@ from pydantic import BaseModel, EmailStr, Field, validator, model_validator
 
 class ActionType(str, Enum):
     """Admin router action types."""
+    CREATE_ADMIN = "CREATE_ADMIN"
     CREATE_COURSE = "CREATE_COURSE"
     EDIT_COURSE = "EDIT_COURSE"
     DELETE_COURSE = "DELETE_COURSE"
@@ -35,6 +36,8 @@ class ActionType(str, Enum):
     UPDATE_LEARNER = "UPDATE_LEARNER"
     DELETE_LEARNER = "DELETE_LEARNER"
     VALIDATE_CSV_ORGANIZATION_CONFLICTS = "VALIDATE_CSV_ORGANIZATION_CONFLICTS"
+    TEST_EMAIL = "TEST_EMAIL"
+    DOWNLOAD_LEARNERS_CSV = "DOWNLOAD_LEARNERS_CSV"
 
 
 class SOPActionType(str, Enum):
@@ -211,12 +214,20 @@ class ResetSOPPasswordPayload(BaseModel):
     new_password: str = Field(..., min_length=6, max_length=100)
 
 
+class CreateAdminPayload(BaseModel):
+    """Payload for creating an admin user."""
+    email: EmailStr
+    password: str = Field(..., min_length=6, max_length=100)
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+
+
 # Learner Models
 class LearnerCSVRow(BaseModel):
     """Single learner row from CSV."""
     name: str = Field(..., min_length=1, max_length=255)
     email: EmailStr
     organization_website: str = Field(..., min_length=1, max_length=255)
+    password: str = Field(..., min_length=1, max_length=255)
 
 
 class UploadLearnersCSVPayload(BaseModel):
@@ -245,6 +256,17 @@ class DeleteLearnerPayload(BaseModel):
     """Payload for deleting a learner from an organization."""
     learner_email: EmailStr
     organization_website: str = Field(..., min_length=1, max_length=255)
+
+
+class TestEmailPayload(BaseModel):
+    """Payload for testing email delivery."""
+    to_email: EmailStr
+    subject: Optional[str] = Field(None, max_length=255)
+    message: Optional[str] = Field(None, max_length=2000)
+    html_content: Optional[str] = Field(None)  # HTML content for PDF generation
+    learner_name: Optional[str] = Field(None, max_length=255)  # For placeholder replacement
+    course_name: Optional[str] = Field(None, max_length=255)  # For placeholder replacement
+    completion_date: Optional[str] = Field(None, max_length=255)  # For placeholder replacement
 
 
 class CSVValidationResult(BaseModel):

@@ -106,17 +106,21 @@ class CertificateRenderer:
         """
         try:
             # Sanitize template first
-            sanitized_template = self.sanitize_template(template_html)
+            #sanitized_template = self.sanitize_template(template_html)
             
             # Create template
-            template = self.jinja_env.from_string(sanitized_template)
-            
+            template = self.jinja_env.from_string(template_html)
+
+            # Convert date format
+            iso_date_str = str(context.completion_date)
+            formatted_date = self._date_format_filter(iso_date_str, "%B %d, %Y")
+
             # Prepare context data with both formats (curly braces and underscores)
             context_data = {
                 # Underscore format (Jinja2 style)
                 'learner_name': context.learner_name,
                 'course_name': context.course_name,
-                'completion_date': context.completion_date,
+                'completion_date': formatted_date,
                 'organization': context.organization,
                 'learner_email': context.learner_email,
                 'custom_fields': context.custom_fields or {},
@@ -124,7 +128,7 @@ class CertificateRenderer:
                 # Curly brace format (simple replacement)
                 'learnerName': context.learner_name,
                 'courseName': context.course_name,
-                'completionDate': context.completion_date,
+                'completionDate': formatted_date,
                 'organizationName': context.organization,
                 'learnerEmail': context.learner_email
             }
@@ -139,7 +143,7 @@ class CertificateRenderer:
             # Also handle simple curly brace replacement for templates that don't use Jinja2
             rendered_html = rendered_html.replace('{learnerName}', context.learner_name)
             rendered_html = rendered_html.replace('{courseName}', context.course_name)
-            rendered_html = rendered_html.replace('{completionDate}', context.completion_date)
+            rendered_html = rendered_html.replace('{completionDate}', formatted_date)
             rendered_html = rendered_html.replace('{organizationName}', context.organization)
             rendered_html = rendered_html.replace('{learnerEmail}', context.learner_email)
             
@@ -268,13 +272,22 @@ class CertificateRenderer:
 
     def get_pdf_bytes(self, html_content: str, context: CertificateContext) -> Optional[bytes]:
         """
-        Generate PDF bytes directly from HTML content using PDFEndpoint API.
+        Generate PDF bytes directly from HTML content.
+        Primary method: WeasyPrint
+        Fallback method: PDFEndpoint API
         """
         try:
-            # Render HTML with context
+            # Render HTML with context (this handles all dynamic value logic)
             rendered_html = self.render_certificate(html_content, context)
             
-            logger.info("Generating PDF using PDFEndpoint API")
+            # # Try WeasyPrint first (primary method)
+            # pdf_bytes = self._generate_pdf_with_weasyprint(rendered_html)
+            # if pdf_bytes:
+            #     logger.info(f"PDF generated successfully using WeasyPrint: {len(pdf_bytes)} bytes")
+            #     return pdf_bytes
+            
+            # Fallback to PDFEndpoint API if WeasyPrint fails
+            logger.info("WeasyPrint failed, falling back to PDFEndpoint API")
             pdf_result = self._generate_pdf_with_pdfendpoint(rendered_html, "certificate.pdf")
             
             if pdf_result['success']:
@@ -298,6 +311,45 @@ class CertificateRenderer:
             logger.error(f"Error generating PDF bytes: {e}")
             return None
 
+    def _generate_pdf_with_weasyprint(self, html_filled: str) -> Optional[bytes]:
+        """
+        Generate PDF using WeasyPrint library.
+        Returns PDF bytes if successful, None otherwise.
+        """
+        try:
+            from weasyprint import HTML, CSS
+            from io import BytesIO
+            
+            logger.info("Generating PDF using WeasyPrint")
+            
+            # CSS to scale the HTML to fit A3 page (as per user's requirement)
+            scaling_css = CSS(string="""
+                @page {
+                    size: A3;
+                    margin: 0;
+                }
+            """)
+            
+            # Generate PDF to bytes buffer
+            pdf_buffer = BytesIO()
+            HTML(string=html_filled).write_pdf(pdf_buffer, stylesheets=[scaling_css])
+            pdf_bytes = pdf_buffer.getvalue()
+            pdf_buffer.close()
+            
+            if pdf_bytes and len(pdf_bytes) > 0:
+                logger.info(f"WeasyPrint generated PDF: {len(pdf_bytes)} bytes")
+                return pdf_bytes
+            else:
+                logger.warning("WeasyPrint generated empty PDF")
+                return None
+                
+        except ImportError:
+            logger.warning("WeasyPrint not available, will use fallback method")
+            return None
+        except Exception as e:
+            logger.error(f"WeasyPrint PDF generation error: {e}")
+            return None
+
     def _generate_pdf_with_pdfendpoint(self, html_content: str, filename: str) -> dict:
         """
         Generate PDF using PDFEndpoint API with full CSS support.
@@ -318,11 +370,9 @@ class CertificateRenderer:
             # Prepare payload
             payload = {
                 "html": html_content,
-                "margin_top": "1cm",
-                "margin_bottom": "1cm", 
-                "margin_right": "1cm",
-                "margin_left": "1cm",
-                "no_backgrounds": True
+                "sandbox": False,
+                "orientation": "horizontal",
+                "page_size": "A4"
             }
             
             logger.info(f"Sending request to PDFEndpoint API: {len(html_content)} characters")

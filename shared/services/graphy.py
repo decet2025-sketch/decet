@@ -323,6 +323,7 @@ class GraphyService:
                     'limit': 1  # We only need one result
                 }
             )
+            logger.error("got response from graphy " + str(result))
             
             if result['ok'] and 'data' in result['data']:
                 learners = result['data']['data']
@@ -347,7 +348,7 @@ class GraphyService:
                 'error': f"Failed to get learner data: {str(e)}"
             }
 
-    def create_learner(self, email: str, name: str) -> Dict[str, Any]:
+    def create_learner(self, email: str, name: str, password: str) -> Dict[str, Any]:
         """Create a learner in Graphy/Spayee."""
         try:
             # Use form data for Graphy API
@@ -355,7 +356,8 @@ class GraphyService:
                 'mid': self.merchant_id,
                 'key': self.api_key,
                 'email': email,
-                'name': name
+                'name': name,
+                'password': password
             }
             
             url = 'https://api.ongraphy.com/public/v1/learners'

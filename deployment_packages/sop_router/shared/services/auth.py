@@ -273,6 +273,8 @@ class AuthService:
         try:
             from appwrite.services.users import Users
             from appwrite.id import ID
+            from appwrite.exception import AppwriteException
+            from appwrite.query import Query
             
             # Initialize Appwrite client
             from appwrite.client import Client
@@ -284,71 +286,101 @@ class AuthService:
             # Initialize Users service
             users = Users(client)
             
-            # First, try to find existing user by email
-            try:
-                # Search for user by email - get all users and filter by exact email match
-                existing_users = users.list()
-                
-                # Find exact email match
-                exact_match = None
-                if existing_users['total'] > 0:
-                    for user in existing_users['users']:
-                        if user.get('email', '').lower() == email.lower():
-                            exact_match = user
-                            break
-                
-                if exact_match:
-                    # User exists with exact email match, return existing user data
-                    logger.info(f"User {email} already exists with ID {exact_match['$id']}")
-                    
-                    return {
-                        'ok': True,
-                        'data': {
-                            '$id': exact_match['$id'],
-                            'email': exact_match['email'],
-                            'name': exact_match['name'],
-                            'role': role,
-                            'organization_website': organization_website,
-                            'existing': True  # Flag to indicate this is an existing user
-                        }
-                    }
-                    
-            except Exception as search_error:
-                # If search fails, continue with user creation
-                logger.info(f"Could not search for existing user: {search_error}, proceeding with creation")
-            
-            # User doesn't exist, create new user
-            user = users.create(
-                user_id=ID.unique(),  # Auto-generate unique user ID
-                email=email,
-                password=password,    # Appwrite handles password hashing
-                name=name
-            )
-            
-            # Add role as a label to the user
-            if role:
-                users.update_labels(
-                    user_id=user['$id'],
-                    labels=[role]
-                )
-            
-            # Add organization website to user preferences if provided
-            if organization_website:
-                users.update_prefs(
-                    user_id=user['$id'],
-                    prefs={
+            def _find_user_by_email() -> Optional[Dict[str, Any]]:
+                try:
+                    result = users.list(queries=[Query.equal('email', email)])
+                    if result.get('total'):
+                        return result['users'][0]
+                except Exception as query_error:
+                    logger.warning(f"Query search for user {email} failed: {query_error}. Falling back to full list scan")
+                    try:
+                        result = users.list()
+                        if result.get('total'):
+                            for existing in result['users']:
+                                if existing.get('email', '').lower() == email.lower():
+                                    return existing
+                    except Exception as list_error:
+                        logger.error(f"Full list search for user {email} failed: {list_error}")
+                return None
+
+            def _ensure_role_metadata(user_id: str, current_user: Dict[str, Any]):
+                try:
+                    if role:
+                        current_labels = current_user.get('labels', []) or []
+                        if role not in current_labels:
+                            users.update_labels(
+                                user_id=user_id,
+                                labels=list(set(current_labels + [role]))
+                            )
+                except Exception as label_error:
+                    logger.warning(f"Failed to update labels for user {user_id}: {label_error}")
+
+                try:
+                    prefs = current_user.get('prefs', {}) or {}
+                    needs_update = False
+                    if prefs.get('role') != role:
+                        prefs['role'] = role
+                        needs_update = True
+                    if organization_website:
+                        if prefs.get('organization_website') != organization_website:
+                            prefs['organization_website'] = organization_website
+                            needs_update = True
+                    elif 'organization_website' in prefs and prefs.get('organization_website') is None:
+                        # No change needed when None
+                        pass
+
+                    if needs_update:
+                        users.update_prefs(user_id=user_id, prefs=prefs)
+                except Exception as prefs_error:
+                    logger.warning(f"Failed to update prefs for user {user_id}: {prefs_error}")
+
+            existing_user = _find_user_by_email()
+            if existing_user:
+                logger.info(f"User {email} already exists with ID {existing_user['$id']}")
+                _ensure_role_metadata(existing_user['$id'], existing_user)
+
+                return {
+                    'ok': True,
+                    'data': {
+                        '$id': existing_user['$id'],
+                        'email': existing_user['email'],
+                        'name': existing_user.get('name', name),
                         'role': role,
-                        'organization_website': organization_website
+                        'organization_website': organization_website,
+                        'existing': True
                     }
+                }
+
+            try:
+                user = users.create(
+                    user_id=ID.unique(),
+                    email=email,
+                    password=password,
+                    name=name
                 )
-            else:
-                users.update_prefs(
-                    user_id=user['$id'],
-                    prefs={'role': role}
-                )
-            
+            except AppwriteException as creation_error:
+                if creation_error.code == 409 or 'already exists' in str(creation_error).lower():
+                    logger.info(f"User {email} already exists (caught during creation). Treating as existing user")
+                    existing_user = _find_user_by_email()
+                    if existing_user:
+                        _ensure_role_metadata(existing_user['$id'], existing_user)
+                        return {
+                            'ok': True,
+                            'data': {
+                                '$id': existing_user['$id'],
+                                'email': existing_user['email'],
+                                'name': existing_user.get('name', name),
+                                'role': role,
+                                'organization_website': organization_website,
+                                'existing': True
+                            }
+                        }
+                raise
+
+            _ensure_role_metadata(user['$id'], user)
+
             logger.info(f"Successfully created new user {email} with ID {user['$id']}")
-            
+
             return {
                 'ok': True,
                 'data': {
@@ -357,7 +389,7 @@ class AuthService:
                     'name': user['name'],
                     'role': role,
                     'organization_website': organization_website,
-                    'existing': False  # Flag to indicate this is a new user
+                    'existing': False
                 }
             }
             

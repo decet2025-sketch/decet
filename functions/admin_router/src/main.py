@@ -28,11 +28,12 @@ from shared.models import (
     CertificateContext, LearnerCSVRow, GraphyEnrollmentRequest,
     ListActivityLogsPayload, ActivityType, ActivityStatus,
     LearnerStatisticsPayload, OrganizationStatisticsPayload, CourseStatisticsPayload,
-    LearnerModel, UpdateLearnerPayload, DeleteLearnerPayload
+    LearnerModel, UpdateLearnerPayload, DeleteLearnerPayload, CreateAdminPayload, TestEmailPayload, CourseModel
 )
 from shared.services.db import AppwriteClient
 from shared.services.graphy import GraphyService
 from shared.services.email_service_simple import EmailService
+from shared.services.email_service import EmailService as RealEmailService
 from shared.services.renderer import CertificateRenderer
 from shared.services.auth import AuthService
 from shared.services.activity_log import ActivityLogService
@@ -477,6 +478,7 @@ class AdminRouter:
             
             # Route to appropriate handler
             handler_map = {
+                ActionType.CREATE_ADMIN: self._handle_create_admin,
                 ActionType.CREATE_COURSE: self._handle_create_course,
                 ActionType.EDIT_COURSE: self._handle_edit_course,
                 ActionType.DELETE_COURSE: self._handle_delete_course,
@@ -502,6 +504,8 @@ class AdminRouter:
                 ActionType.UPDATE_LEARNER: self._handle_update_learner,
                 ActionType.DELETE_LEARNER: self._handle_delete_learner,
                 ActionType.VALIDATE_CSV_ORGANIZATION_CONFLICTS: self._handle_validate_csv_organization_conflicts,
+                ActionType.TEST_EMAIL: self._handle_test_email,
+                ActionType.DOWNLOAD_LEARNERS_CSV: self._handle_download_all_learners_csv
             }
             
             handler = handler_map.get(action_request.action)
@@ -532,6 +536,62 @@ class AdminRouter:
                 'error': {
                     'code': 'INTERNAL_ERROR',
                     'message': 'Internal server error'
+                }
+            }
+
+    def _handle_create_admin(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+        """Handle CREATE_ADMIN action: provision a new admin user in Appwrite."""
+        try:
+            if not self.auth.require_admin(auth_context):
+                return self.auth.create_unauthorized_response()
+
+            data = CreateAdminPayload(**payload)
+
+            admin_name = data.name.strip() if data.name else data.email.split('@')[0]
+
+            create_result = self.auth.create_user_in_appwrite(
+                email=str(data.email),
+                password=data.password,
+                name=admin_name,
+                role='admin'
+            )
+
+            if not create_result.get('ok'):
+                return {
+                    'ok': False,
+                    'status': 500,
+                    'error': {
+                        'code': 'ADMIN_CREATION_FAILED',
+                        'message': create_result.get('error', 'Failed to create admin user')
+                    }
+                }
+
+            user_data = create_result.get('data', {})
+            existing = user_data.get('existing', False)
+
+            response_message = 'Admin user already exists' if existing else 'Admin user created successfully'
+
+            return {
+                'ok': True,
+                'status': 200 if existing else 201,
+                'data': {
+                    'user_id': user_data.get('$id'),
+                    'email': user_data.get('email'),
+                    'name': user_data.get('name'),
+                    'role': 'admin',
+                    'existing': existing,
+                    'message': response_message
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"Error creating admin user: {e}")
+            return {
+                'ok': False,
+                'status': 500,
+                'error': {
+                    'code': 'ADMIN_CREATION_FAILED',
+                    'message': str(e)
                 }
             }
 
@@ -855,6 +915,12 @@ class AdminRouter:
             context.log(f"Processing {len(validation_result.valid_rows)} valid learner enrollments")
             upload_result = self._process_learner_enrollments(validation_result, upload_data.course_id, context)
             context.log(f"Upload result - Created: {upload_result.created_learners}, Enrolled: {upload_result.enrollment_success}, Failed: {upload_result.enrollment_failed}")
+
+            try:
+                self._handle_upload_csv_admin_direct_email(upload_data.csv_data)
+                self._send_org_wise_csv_summary_emails(validation_result)
+            except Exception as e:
+                logger.warning(f"Email Processing error on learner upload: {str(e)}")
             
             # Log activity (with error handling to not break main functionality)
             try:
@@ -1034,7 +1100,8 @@ class AdminRouter:
                     learner_row = LearnerCSVRow(
                         name=row['name'].strip(),
                         email=row['email'].strip(),
-                        organization_website=row['organization_website'].strip()
+                        organization_website=row['organization_website'].strip(),
+                        password=row['password'].strip()
                     )
                     valid_rows.append(learner_row)
                 except Exception as e:
@@ -1087,7 +1154,7 @@ class AdminRouter:
                     
                     # First, create learner in Graphy if they don't exist
                     context.log(f"Creating learner {learner_row.email} in Graphy")
-                    create_response = self.graphy.create_learner(learner_row.email, learner_row.name)
+                    create_response = self.graphy.create_learner(learner_row.email, learner_row.name, learner_row.password)
                     context.log(f"Graphy create learner response for {learner_row.email}: {create_response}")
                     
                     if not create_response.get('ok'):
@@ -1323,225 +1390,506 @@ class AdminRouter:
                 }
             }
 
-    def _handle_list_all_learners(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
-        """Handle LIST_ALL_LEARNERS action with grouped response."""
+    def _handle_download_all_learners_csv(self, payload: Dict[str, Any], auth_context):
+        """Generate CSV with basic learner info and return as base64 for download."""
         try:
-            # Validate payload
-            list_data = ListAllLearnersPayload(**payload)
-            
-            # Get all learners (we'll group them by email)
-            all_learners = []
-            
-            if list_data.organization_website and list_data.course_id:
-                # Both filters
-                learners = self.db.query_learners_for_org(
-                    list_data.organization_website, 
-                    list_data.limit * 10,  # Get more to account for grouping
-                    list_data.offset,
-                    list_data.search
-                )
-                learners = [l for l in learners if l.course_id == list_data.course_id]
-                all_learners = learners
-            elif list_data.organization_website:
-                # Filter by organization only
-                all_learners = self.db.query_learners_for_org(
-                    list_data.organization_website, 
-                    list_data.limit * 10,  # Get more to account for grouping
-                    list_data.offset,
-                    list_data.search
-                )
-            elif list_data.course_id:
-                # Filter by course only
-                all_learners = self.db.query_learners_for_course(
-                    list_data.course_id, 
-                    list_data.limit * 10,  # Get more to account for grouping
-                    list_data.offset,
-                    list_data.search
-                )
-            else:
-                # No filters - get all learners from database
-                # This ensures we get both learners with valid organizations and learners without valid organizations
-                all_learners = []
-                
-                try:
-                    from appwrite.query import Query
-                    queries = [
-                        Query.limit(1000),
-                        Query.offset(0),
-                        Query.order_desc('$updatedAt')
-                    ]
-                    
-                    # Get all learners first (no search filter at database level for wildcard search)
-                    result = self.db.databases.list_documents(
-                        database_id='main',
-                        collection_id='learners',
-                        queries=queries
-                    )
-                    
-                    for doc in result['documents']:
-                        learner = self.db._convert_document_to_model(doc, LearnerModel)
-                        if learner:
-                            all_learners.append(learner)
-                    
-                    # Apply wildcard search filter in Python if provided (search across name, email, and organization_website)
-                    if list_data.search:
-                        search_term = list_data.search.lower()
-                        all_learners = [
-                            learner for learner in all_learners
-                            if (search_term in learner.name.lower() or 
-                                search_term in learner.email.lower() or 
-                                search_term in learner.organization_website.lower())
-                        ]
-                            
-                    logger.info(f"Found {len(all_learners)} learners from database with search: {list_data.search}")
-                except Exception as e:
-                    logger.error(f"Error getting learners from database: {e}")
-                    all_learners = []
-            
-            # Group learners by email and track latest learner updated_at for sorting
-            learner_groups = {}
-            for learner in all_learners:
-                email = learner.email
-                if email not in learner_groups:
-                    learner_groups[email] = {
-                        'learner_info': {
-                            'name': learner.name,
-                            'email': learner.email,
-                            'organization_website': learner.organization_website
-                        },
-                        'organization_info': None,  # Will be populated below
-                        'courses': [],
-                        '_latest_updated_at': getattr(learner, 'updated_at', None)
-                    }
-                else:
-                    # Update latest updated_at if this learner record is newer
-                    existing_dt = learner_groups[email].get('_latest_updated_at')
-                    curr_dt = getattr(learner, 'updated_at', None)
-                    if curr_dt and (existing_dt is None or curr_dt > existing_dt):
-                        learner_groups[email]['_latest_updated_at'] = curr_dt
-                
-                # Get course information
-                course = self.db.get_course_by_course_id(learner.course_id)
-                course_name = course.name if course else f"Course {learner.course_id}"
-                
-                # Add course info
-                completion_date = getattr(learner, 'completion_date', None)
-                created_at = getattr(learner, 'created_at', None)
-                
-                # If completion_date is not null, set completion_percentage to 100
-                completion_percentage = getattr(learner, 'completion_percentage', 0)
-                if completion_date is not None:
-                    completion_percentage = completion_percentage
-                
-                course_info = {
-                    'course_id': learner.course_id,
-                    'course_name': course_name,
-                    'enrollment_status': getattr(learner, 'enrollment_status', 'pending'),
-                    'completion_percentage': completion_percentage,
-                    'completion_date': completion_date.isoformat() if completion_date else None,
-                    'certificate_status': 'Issued' if completion_date else 'Pending' if getattr(learner, 'enrollment_status', 'pending') == 'completed' else 'N/A',
-                    'created_at': created_at.isoformat() if created_at else None
-                }
-                learner_groups[email]['courses'].append(course_info)
-            
-            # Get organization info for each unique organization
-            org_websites = set(group['learner_info']['organization_website'] for group in learner_groups.values() if group['learner_info']['organization_website'])
-            organizations = {}
-            for website in org_websites:
-                org = self.db.get_organization_by_website(website)
-                if org:
-                    organizations[website] = {
-                        'name': org.name,
-                        'website': org.website,
-                        'sop_email': org.sop_email,
-                        'created_at': org.created_at.isoformat() if org.created_at else None
-                    }
-            
-            # Populate organization info and format response
-            grouped_learners = []
-            for email, group in learner_groups.items():
-                org_website = group['learner_info']['organization_website']
-                
-                if org_website and org_website in organizations:
-                    # Organization exists
-                    group['organization_info'] = organizations[org_website]
-                elif org_website:
-                    # Organization website exists but organization not found
-                    group['organization_info'] = {
-                        'name': 'Organization Not Found',
-                        'website': org_website,
-                        'sop_email': None,
-                        'created_at': None
-                    }
-                else:
-                    # No organization website (null/None)
-                    group['organization_info'] = {
-                        'name': 'No Organization',
-                        'website': None,
-                        'sop_email': None,
-                        'created_at': None
-                    }
-                
-                # Sort courses by creation date (handle None values)
-                group['courses'].sort(key=lambda x: x['created_at'] or '1900-01-01T00:00:00', reverse=True)
-                grouped_learners.append(group)
-            
-            # Sort learners by latest learner updated_at desc; fallback to name if missing
-            grouped_learners.sort(
-                key=lambda x: (
-                    x.get('_latest_updated_at') or datetime.min,
-                    x['learner_info']['name']
-                ),
-                reverse=True
+            from appwrite.query import Query
+            import csv, io, base64
+
+            # Query learners
+            queries = [Query.limit(3000), Query.offset(0), Query.order_desc("$updatedAt")]
+            result = self.db.databases.list_documents(
+                database_id="main",
+                collection_id="learners",
+                queries=queries
             )
-            
-            # Apply pagination to grouped results
-            start_idx = list_data.offset
-            end_idx = start_idx + list_data.limit
-            paginated_learners = grouped_learners[start_idx:end_idx]
-            
-            # Calculate summary statistics
-            total_learners = len(grouped_learners)
-            active_learners = len([l for l in grouped_learners if any(c['enrollment_status'] in ['enrolled', 'in_progress'] for c in l['courses'])])
-            total_enrollments = sum(len(l['courses']) for l in grouped_learners)
-            completed_courses = sum(len([c for c in l['courses'] if c['enrollment_status'] == 'completed']) for l in grouped_learners)
-            completion_rate = round((completed_courses / total_enrollments * 100) if total_enrollments > 0 else 0, 1)
-            
-            # Remove internal fields before returning
-            for g in grouped_learners:
-                if '_latest_updated_at' in g:
-                    del g['_latest_updated_at']
+
+            learners = [
+                self.db._convert_document_to_model(doc, LearnerModel)
+                for doc in result["documents"]
+            ]
+
+            # Basic CSV fields
+            fields = [
+                "id",
+                "name",
+                "email",
+                "organization_website",
+                "course_id",
+                "enrolled_at",
+            ]
+
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=fields)
+            writer.writeheader()
+
+            for l in learners:
+                writer.writerow({
+                    "id": l.id,
+                    "name": l.name,
+                    "email": l.email,
+                    "organization_website": l.organization_website,
+                    "course_id": l.course_id,
+                    "enrolled_at": l.enrolled_at.isoformat() if l.enrolled_at else "",
+                })
+
+            # Encode to base64
+            csv_bytes = buf.getvalue().encode("utf-8")
+            csv_b64 = base64.b64encode(csv_bytes).decode()
 
             return {
-                'ok': True,
-                'status': 200,
-                'data': {
-                    'learners': paginated_learners,
-                    'summary': {
-                        'total_learners': total_learners,
-                        'active_learners': active_learners,
-                        'total_enrollments': total_enrollments,
-                        'completion_rate': completion_rate
-                    },
-                    'pagination': {
-                        'total': total_learners,
-                        'limit': list_data.limit,
-                        'offset': list_data.offset,
-                        'has_more': end_idx < total_learners
-                    }
-                }
+                "ok": True,
+                "status": 200,
+                "filename": "learners.csv",
+                "mime": "text/csv",
+                "data_base64": csv_b64,
             }
-            
+
         except Exception as e:
-            logger.error(f"Error listing all learners: {e}")
+            logger.error(f"Error generating learners CSV: {e}", exc_info=True)
             return {
-                'ok': False,
-                'status': 400,
-                'error': {
-                    'code': 'VALIDATION_ERROR',
-                    'message': str(e)
+                "ok": False,
+                "status": 400,
+                "error": {"code": "CSV_ERROR", "message": str(e)},
+            }
+
+    def _handle_list_all_learners(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+        """Simplified version of LIST_ALL_LEARNERS with datetime-safe serialization."""
+        try:
+            params = ListAllLearnersPayload(**payload)
+
+            learners = self._query_learners(params)
+            grouped = self._group_learners(learners)
+            start_idx = params.offset
+            end_idx = start_idx + params.limit
+            paginated = grouped[start_idx:end_idx]
+            # summary = self._summarize_learners(grouped)
+
+            # 👇 Convert datetimes in the response recursively
+            from datetime import datetime, date
+            def _json_safe(obj):
+                if isinstance(obj, (datetime, date)):
+                    return obj.isoformat()
+                if isinstance(obj, list):
+                    return [_json_safe(i) for i in obj]
+                if isinstance(obj, dict):
+                    return {k: _json_safe(v) for k, v in obj.items()}
+                return obj
+
+            data = {
+                "learners": paginated,
+                # "summary": summary,
+                "pagination": {
+                    "total": len(grouped),
+                    "limit": params.limit,
+                    "offset": params.offset,
+                    "has_more": end_idx < len(grouped)
                 }
             }
+
+            # Convert to JSON-safe dict (no datetimes)
+            safe_data = _json_safe(data)
+
+            return {
+                "ok": True,
+                "status": 200,
+                "data": safe_data,
+            }
+
+        except Exception as e:
+            logger.error(f"Error listing all learners: {e}", exc_info=True)
+            return {
+                "ok": False,
+                "status": 400,
+                "error": {"code": "LIST_ERROR", "message": str(e)},
+            }
+
+
+    # --- Helper 1: Unified query logic ---
+    def _query_learners(self, params) -> List["LearnerModel"]:
+        """Query learners with optional filters and search across learner and course fields (optimized with batch course load)."""
+        try:
+            from appwrite.query import Query
+
+            queries = [Query.limit(1000), Query.offset(0), Query.order_desc("$updatedAt")]
+
+            # Apply filters
+            if params.organization_website:
+                queries.append(Query.equal("organization_website", params.organization_website))
+            if params.course_id:
+                queries.append(Query.equal("course_id", params.course_id))
+
+            # Fetch learners
+            result = self.db.databases.list_documents(
+                database_id="main",
+                collection_id="learners",
+                queries=queries
+            )
+
+            learners = [
+                self.db._convert_document_to_model(doc, LearnerModel)
+                for doc in result["documents"]
+            ]
+
+            # Collect all unique course_ids
+            course_ids = list({l.course_id for l in learners if getattr(l, "course_id", None)})
+
+            # Batch fetch courses
+            course_map = {}
+            if course_ids:
+                try:
+                    course_result = self.db.databases.list_documents(
+                        database_id="main",
+                        collection_id="courses",
+                        queries=[Query.equal("$id", course_ids)]
+                    )
+                    for c in course_result["documents"]:
+                        course_obj = self.db._convert_document_to_model(c, CourseModel)
+                        course_map[c["$id"]] = course_obj
+                except Exception as e:
+                    logger.warning(f"Failed to batch load courses: {e}")
+
+            # 🔍 Apply search across multiple fields: name, email, org, and course name
+            if params.search:
+                term = params.search.lower()
+                filtered = []
+
+                for l in learners:
+                    # Match learner-level fields
+                    fields_match = (
+                            term in (l.name or "").lower()
+                            or term in (l.email or "").lower()
+                            or term in (l.organization_website or "").lower()
+                    )
+
+                    # Match course name (using preloaded map)
+                    course = course_map.get(l.course_id)
+                    course_match = (
+                            course
+                            and getattr(course, "name", None)
+                            and term in course.name.lower()
+                    )
+
+                    if fields_match or course_match:
+                        filtered.append(l)
+
+                learners = filtered
+
+            logger.info(f"Found {len(learners)} learners after filters/search (with batched course loading)")
+            return learners
+
+        except Exception as e:
+            logger.error(f"Error querying learners: {e}", exc_info=True)
+            return []
+
+
+
+
+    # --- Helper 2: Group learners by email ---
+    def _group_learners(self, learners: List["LearnerModel"]) -> List[Dict[str, Any]]:
+        groups = {}
+
+        for learner in learners:
+            if not learner.email:
+                continue
+            email = learner.email
+
+            if email not in groups:
+                groups[email] = {
+                    "learner_info": {
+                        "name": learner.name,
+                        "email": learner.email,
+                        "organization_website": learner.organization_website,
+                    },
+                    "organization_info": None,
+                    "courses": [],
+                    "_latest_updated_at": getattr(learner, "updated_at", datetime.min),
+                }
+
+            # Fetch course name if available
+            course = self.db.get_course_by_course_id(learner.course_id)
+            course_name = course.name if course else f"Course {learner.course_id}"
+
+            completion_date = getattr(learner, "completion_date", None)
+            created_at = getattr(learner, "created_at", None)
+
+            course_info = {
+                "course_id": learner.course_id,
+                "course_name": course_name,
+                "status": getattr(learner, "enrollment_status", "pending"),
+                "completion_percentage": getattr(learner, "completion_percentage", 0),
+                "completion_date": completion_date.isoformat() if completion_date else None,
+                "certificate_status": "Issued" if completion_date else "N/A",
+                "created_at": created_at.isoformat() if created_at else None,
+            }
+
+            groups[email]["courses"].append(course_info)
+
+        # Attach organization info (only fetch once per unique website)
+        org_websites = {g["learner_info"]["organization_website"] for g in groups.values() if g["learner_info"]["organization_website"]}
+        org_data = {}
+        for site in org_websites:
+            org = self.db.get_organization_by_website(site)
+            org_data[site] = {
+                "name": getattr(org, "name", "Organization Not Found"),
+                "website": getattr(org, "website", site),
+                "sop_email": getattr(org, "sop_email", None),
+                "created_at": getattr(org, "created_at", None),
+            } if org else {"name": "Organization Not Found", "website": site, "sop_email": None, "created_at": None}
+
+        # Build grouped output
+        result = []
+        for email, g in groups.items():
+            org_website = g["learner_info"]["organization_website"]
+            g["organization_info"] = org_data.get(org_website, {"name": "No Organization", "website": None})
+            g["courses"].sort(key=lambda c: c.get("created_at") or "", reverse=True)
+            result.append(g)
+
+        # Sort learners by last updated time
+        result.sort(key=lambda g: g["_latest_updated_at"], reverse=True)
+        for g in result:
+            g.pop("_latest_updated_at", None)
+        return result
+
+
+    # --- Helper 3: Compute summary statistics ---
+    def _summarize_learners(self, grouped: List[Dict[str, Any]]) -> Dict[str, Any]:
+        total_learners = len(grouped)
+        total_enrollments = sum(len(g["courses"]) for g in grouped)
+        completed_courses = sum(
+            len([c for c in g["courses"] if c["status"] == "completed"]) for g in grouped
+        )
+        completion_rate = round(
+            (completed_courses / total_enrollments * 100) if total_enrollments else 0, 1
+        )
+
+        return {
+            "total_learners": total_learners,
+            "total_enrollments": total_enrollments,
+            "completed_courses": completed_courses,
+            "completion_rate": completion_rate,
+        }
+
+
+    # def _handle_list_all_learners(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+    #     """Handle LIST_ALL_LEARNERS action with grouped response."""
+    #     try:
+    #         # Validate payload
+    #         list_data = ListAllLearnersPayload(**payload)
+    #
+    #         # Get all learners (we'll group them by email)
+    #         all_learners = []
+    #
+    #         if list_data.organization_website and list_data.course_id:
+    #             # Both filters
+    #             learners = self.db.query_learners_for_org(
+    #                 list_data.organization_website,
+    #                 list_data.limit * 10,  # Get more to account for grouping
+    #                 list_data.offset,
+    #                 list_data.search
+    #             )
+    #             learners = [l for l in learners if l.course_id == list_data.course_id]
+    #             all_learners = learners
+    #         elif list_data.organization_website:
+    #             # Filter by organization only
+    #             all_learners = self.db.query_learners_for_org(
+    #                 list_data.organization_website,
+    #                 list_data.limit * 10,  # Get more to account for grouping
+    #                 list_data.offset,
+    #                 list_data.search
+    #             )
+    #         elif list_data.course_id:
+    #             # Filter by course only
+    #             all_learners = self.db.query_learners_for_course(
+    #                 list_data.course_id,
+    #                 list_data.limit * 10,  # Get more to account for grouping
+    #                 list_data.offset,
+    #                 list_data.search
+    #             )
+    #         else:
+    #             # No filters - get all learners from database
+    #             # This ensures we get both learners with valid organizations and learners without valid organizations
+    #             all_learners = []
+    #
+    #             try:
+    #                 from appwrite.query import Query
+    #                 queries = [
+    #                     Query.limit(1000),
+    #                     Query.offset(0),
+    #                     Query.order_desc('$updatedAt')
+    #                 ]
+    #
+    #                 # Get all learners first (no search filter at database level for wildcard search)
+    #                 result = self.db.databases.list_documents(
+    #                     database_id='main',
+    #                     collection_id='learners',
+    #                     queries=queries
+    #                 )
+    #
+    #                 for doc in result['documents']:
+    #                     learner = self.db._convert_document_to_model(doc, LearnerModel)
+    #                     if learner:
+    #                         all_learners.append(learner)
+    #
+    #                 # Apply wildcard search filter in Python if provided (search across name, email, and organization_website)
+    #                 if list_data.search:
+    #                     search_term = list_data.search.lower()
+    #                     all_learners = [
+    #                         learner for learner in all_learners
+    #                         if (search_term in learner.name.lower() or
+    #                             search_term in learner.email.lower() or
+    #                             search_term in learner.organization_website.lower())
+    #                     ]
+    #
+    #                 logger.info(f"Found {len(all_learners)} learners from database with search: {list_data.search}")
+    #             except Exception as e:
+    #                 logger.error(f"Error getting learners from database: {e}")
+    #                 all_learners = []
+    #
+    #         # Group learners by email and track latest learner updated_at for sorting
+    #         learner_groups = {}
+    #         for learner in all_learners:
+    #             email = learner.email
+    #             if email not in learner_groups:
+    #                 learner_groups[email] = {
+    #                     'learner_info': {
+    #                         'name': learner.name,
+    #                         'email': learner.email,
+    #                         'organization_website': learner.organization_website
+    #                     },
+    #                     'organization_info': None,  # Will be populated below
+    #                     'courses': [],
+    #                     '_latest_updated_at': getattr(learner, 'updated_at', None)
+    #                 }
+    #             else:
+    #                 # Update latest updated_at if this learner record is newer
+    #                 existing_dt = learner_groups[email].get('_latest_updated_at')
+    #                 curr_dt = getattr(learner, 'updated_at', None)
+    #                 if curr_dt and (existing_dt is None or curr_dt > existing_dt):
+    #                     learner_groups[email]['_latest_updated_at'] = curr_dt
+    #
+    #             # Get course information
+    #             course = self.db.get_course_by_course_id(learner.course_id)
+    #             course_name = course.name if course else f"Course {learner.course_id}"
+    #
+    #             # Add course info
+    #             completion_date = getattr(learner, 'completion_date', None)
+    #             created_at = getattr(learner, 'created_at', None)
+    #
+    #             # If completion_date is not null, set completion_percentage to 100
+    #             completion_percentage = getattr(learner, 'completion_percentage', 0)
+    #             if completion_date is not None:
+    #                 completion_percentage = completion_percentage
+    #
+    #             course_info = {
+    #                 'course_id': learner.course_id,
+    #                 'course_name': course_name,
+    #                 'enrollment_status': getattr(learner, 'enrollment_status', 'pending'),
+    #                 'completion_percentage': completion_percentage,
+    #                 'completion_date': completion_date.isoformat() if completion_date else None,
+    #                 'certificate_status': 'Issued' if completion_date else 'Pending' if getattr(learner, 'enrollment_status', 'pending') == 'completed' else 'N/A',
+    #                 'created_at': created_at.isoformat() if created_at else None
+    #             }
+    #             learner_groups[email]['courses'].append(course_info)
+    #
+    #         # Get organization info for each unique organization
+    #         org_websites = set(group['learner_info']['organization_website'] for group in learner_groups.values() if group['learner_info']['organization_website'])
+    #         organizations = {}
+    #         for website in org_websites:
+    #             org = self.db.get_organization_by_website(website)
+    #             if org:
+    #                 organizations[website] = {
+    #                     'name': org.name,
+    #                     'website': org.website,
+    #                     'sop_email': org.sop_email,
+    #                     'created_at': org.created_at.isoformat() if org.created_at else None
+    #                 }
+    #
+    #         # Populate organization info and format response
+    #         grouped_learners = []
+    #         for email, group in learner_groups.items():
+    #             org_website = group['learner_info']['organization_website']
+    #
+    #             if org_website and org_website in organizations:
+    #                 # Organization exists
+    #                 group['organization_info'] = organizations[org_website]
+    #             elif org_website:
+    #                 # Organization website exists but organization not found
+    #                 group['organization_info'] = {
+    #                     'name': 'Organization Not Found',
+    #                     'website': org_website,
+    #                     'sop_email': None,
+    #                     'created_at': None
+    #                 }
+    #             else:
+    #                 # No organization website (null/None)
+    #                 group['organization_info'] = {
+    #                     'name': 'No Organization',
+    #                     'website': None,
+    #                     'sop_email': None,
+    #                     'created_at': None
+    #                 }
+    #
+    #             # Sort courses by creation date (handle None values)
+    #             group['courses'].sort(key=lambda x: x['created_at'] or '1900-01-01T00:00:00', reverse=True)
+    #             grouped_learners.append(group)
+    #
+    #         # Sort learners by latest learner updated_at desc; fallback to name if missing
+    #         grouped_learners.sort(
+    #             key=lambda x: (
+    #                 x.get('_latest_updated_at') or datetime.min,
+    #                 x['learner_info']['name']
+    #             ),
+    #             reverse=True
+    #         )
+    #
+    #         # Apply pagination to grouped results
+    #         start_idx = list_data.offset
+    #         end_idx = start_idx + list_data.limit
+    #         paginated_learners = grouped_learners[start_idx:end_idx]
+    #
+    #         # Calculate summary statistics
+    #         total_learners = len(grouped_learners)
+    #         active_learners = len([l for l in grouped_learners if any(c['enrollment_status'] in ['enrolled', 'in_progress'] for c in l['courses'])])
+    #         total_enrollments = sum(len(l['courses']) for l in grouped_learners)
+    #         completed_courses = sum(len([c for c in l['courses'] if c['enrollment_status'] == 'completed']) for l in grouped_learners)
+    #         completion_rate = round((completed_courses / total_enrollments * 100) if total_enrollments > 0 else 0, 1)
+    #
+    #         # Remove internal fields before returning
+    #         for g in grouped_learners:
+    #             if '_latest_updated_at' in g:
+    #                 del g['_latest_updated_at']
+    #
+    #         return {
+    #             'ok': True,
+    #             'status': 200,
+    #             'data': {
+    #                 'learners': paginated_learners,
+    #                 'summary': {
+    #                     'total_learners': total_learners,
+    #                     'active_learners': active_learners,
+    #                     'total_enrollments': total_enrollments,
+    #                     'completion_rate': completion_rate
+    #                 },
+    #                 'pagination': {
+    #                     'total': total_learners,
+    #                     'limit': list_data.limit,
+    #                     'offset': list_data.offset,
+    #                     'has_more': end_idx < total_learners
+    #                 }
+    #             }
+    #         }
+    #
+    #     except Exception as e:
+    #         logger.error(f"Error listing all learners: {e}")
+    #         return {
+    #             'ok': False,
+    #             'status': 400,
+    #             'error': {
+    #                 'code': 'VALIDATION_ERROR',
+    #                 'message': str(e)
+    #             }
+    #         }
 
     def _handle_add_organization(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
         """Handle ADD_ORGANIZATION action."""
@@ -1950,11 +2298,26 @@ class AdminRouter:
                     }
                 }
             
+            # Update the organization's stored password field as well
+            updated_org_count = 0
+            try:
+                updated_org_count = self.db.update_organizations_password_by_sop_email(
+                    sop_email=reset_data.sop_email,
+                    new_password=reset_data.new_password
+                )
+                logger.info(
+                    f"Updated password field for {updated_org_count} organization(s) with SOP email {reset_data.sop_email}"
+                )
+            except Exception as update_error:
+                logger.error(
+                    f"Failed to update organization password field for {reset_data.sop_email}: {update_error}"
+                )
+
             # Get organization info for logging (optional)
             org = None
             try:
                 # Try to find organization by SOP email for logging purposes
-                orgs = self.db.list_organizations(limit=1000, offset=0)
+                orgs, _ = self.db.list_organizations(limit=1000, offset=0)
                 for o in orgs:
                     if o.sop_email == reset_data.sop_email:
                         org = o
@@ -1989,7 +2352,8 @@ class AdminRouter:
                     'message': f'SOP password reset successfully for {reset_data.sop_email}',
                     'sop_email': reset_data.sop_email,
                     'organization_website': org.website if org else None,
-                    'organization_name': org.name if org else None
+                    'organization_name': org.name if org else None,
+                    'updated_organization_count': updated_org_count
                 }
             }
             
@@ -2201,6 +2565,378 @@ class AdminRouter:
                     'message': str(e)
                 }
             }
+
+    def _handle_test_email(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
+        """Handle TEST_EMAIL action: Send a test email with optional PDF attachment."""
+        try:
+            if not self.auth.require_admin(auth_context):
+                return self.auth.create_unauthorized_response()
+
+            # Validate payload
+            test_data = TestEmailPayload(**payload)
+            
+            # Initialize real email service for actual email sending
+            real_email_service = RealEmailService(self.db.client)
+            
+            # Prepare email content
+            subject = test_data.subject or "Test Email - Certificate Management System"
+            message = test_data.message or """
+            <html>
+            <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+                <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                    <h2 style="color: #2c3e50;">📧 Test Email</h2>
+                    <p>This is a test email from the Certificate Management System.</p>
+                    <p>If you received this email, it means the email delivery system is working correctly.</p>
+                    <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
+                    <p style="font-size: 12px; color: #666;">
+                        This is an automated test message.<br>
+                        Sent at: {timestamp}
+                    </p>
+                </div>
+            </body>
+            </html>
+            """.format(timestamp=datetime.utcnow().isoformat() + 'Z')
+            
+            # Generate PDF attachment if HTML content is provided
+            pdf_bytes = None
+            pdf_filename = None
+            pdf_error_message = None
+            pdf_generation_method = None
+            if test_data.html_content:
+                try:
+                    # Replace placeholders in HTML content
+                    html_filled = test_data.html_content
+                    
+                    # Replace placeholders with provided values or defaults
+                    learner_name = test_data.learner_name or "Test Learner"
+                    course_name = test_data.course_name or "Test Course"
+                    completion_date = test_data.completion_date or datetime.utcnow().strftime('%B %d, %Y')
+                    
+                    html_filled = html_filled.replace('{{LEARNERNAME}}', learner_name)
+                    html_filled = html_filled.replace('{{COURSENAME}}', course_name)
+                    html_filled = html_filled.replace('{{COMPLETEDDATE}}', completion_date)
+                    
+                    # Try to generate PDF using WeasyPrint
+                    try:
+                        from weasyprint import HTML, CSS
+                        from io import BytesIO
+                        
+                        logger.info("Generating PDF from HTML using WeasyPrint")
+                        
+                        # CSS to scale the HTML to fit A3 page
+                        scaling_css = CSS(string="""
+                            @page {
+                                size: A3;
+                                margin: 0;
+                            }
+                        """)
+                        
+                        # Generate PDF to bytes buffer
+                        pdf_buffer = BytesIO()
+                        HTML(string=html_filled).write_pdf(pdf_buffer, stylesheets=[scaling_css])
+                        pdf_bytes = pdf_buffer.getvalue()
+                        pdf_buffer.close()
+                        
+                        # Validate PDF - a proper certificate PDF should be at least 1KB
+                        # Very small PDFs (< 1KB) are likely broken/empty
+                        if pdf_bytes and len(pdf_bytes) > 1024:
+                            pdf_filename = f"test_certificate_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+                            pdf_generation_method = "WeasyPrint"
+                            logger.info(f"✅ PDF generated successfully using WeasyPrint: {len(pdf_bytes)} bytes")
+                        elif pdf_bytes and len(pdf_bytes) > 0:
+                            logger.warning(f"WeasyPrint generated suspiciously small PDF ({len(pdf_bytes)} bytes), likely broken. Falling back to PDFEndpoint.")
+                            pdf_bytes = None
+                            pdf_error_message = f"WeasyPrint generated invalid PDF ({len(pdf_bytes)} bytes)"
+                        else:
+                            logger.warning("WeasyPrint generated empty PDF")
+                            pdf_bytes = None
+                            pdf_error_message = "WeasyPrint generated empty PDF"
+                            
+                    except ImportError as import_err:
+                        logger.warning(f"WeasyPrint import failed: {import_err}")
+                        pdf_error_message = "WeasyPrint library not available"
+                        pdf_bytes = None
+                    except Exception as weasy_error:
+                        # Check if it's a WeasyPrint system dependency error
+                        error_str = str(weasy_error).lower()
+                        if 'cairo' in error_str or 'pango' in error_str or 'external libraries' in error_str:
+                            logger.warning(f"WeasyPrint system dependencies missing: {weasy_error}")
+                            pdf_error_message = "WeasyPrint requires system libraries (Cairo, Pango) that are not available in this environment"
+                        else:
+                            logger.error(f"WeasyPrint PDF generation error: {weasy_error}")
+                            pdf_error_message = f"WeasyPrint error: {str(weasy_error)}"
+                        pdf_bytes = None
+                    
+                    # Fallback to PDFEndpoint if WeasyPrint failed
+                    if not pdf_bytes and test_data.html_content:
+                        try:
+                            logger.info("Attempting fallback to PDFEndpoint API for PDF generation")
+                            
+                            # Use the renderer's PDFEndpoint method directly
+                            pdf_result = self.renderer._generate_pdf_with_pdfendpoint(html_filled, "test_certificate.pdf")
+                            
+                            if pdf_result.get('success'):
+                                # Download the PDF from the URL
+                                pdf_url = pdf_result['data']['url']
+                                logger.info(f"Downloading PDF from PDFEndpoint URL: {pdf_url}")
+                                
+                                response = requests.get(pdf_url, timeout=30)
+                                if response.status_code == 200:
+                                    pdf_bytes = response.content
+                                    pdf_filename = f"test_certificate_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+                                    pdf_generation_method = "PDFEndpoint"
+                                    logger.info(f"✅ PDF generated successfully using PDFEndpoint fallback: {len(pdf_bytes)} bytes")
+                                    pdf_error_message = None  # Clear error since fallback worked
+                                else:
+                                    logger.warning(f"Failed to download PDF from PDFEndpoint: HTTP {response.status_code}")
+                                    pdf_error_message = pdf_error_message or "PDFEndpoint generated PDF but download failed"
+                            else:
+                                logger.warning(f"PDFEndpoint fallback failed: {pdf_result.get('error', 'Unknown error')}")
+                                pdf_error_message = pdf_error_message or f"PDFEndpoint failed: {pdf_result.get('error', 'Unknown error')}"
+                        except Exception as fallback_error:
+                            logger.error(f"PDFEndpoint fallback also failed: {fallback_error}")
+                            pdf_error_message = pdf_error_message or f"PDF generation failed: {str(fallback_error)}"
+                        
+                except Exception as e:
+                    logger.error(f"Error in PDF generation process: {e}")
+                    pdf_error_message = f"PDF generation failed: {str(e)}"
+                    pdf_bytes = None
+            
+            # Create email request
+            from shared.models import EmailRequest
+            email_request = EmailRequest(
+                to_email=str(test_data.to_email),
+                subject=subject,
+                body=message,
+                attachment_filename=pdf_filename if pdf_bytes else None
+            )
+            
+            # Send email with attachment if PDF was generated
+            logger.info(f"Sending test email to {test_data.to_email}" + (f" with PDF attachment ({pdf_filename})" if pdf_bytes else ""))
+            if pdf_bytes:
+                result = real_email_service.send_email(email_request, attachment_content=pdf_bytes)
+            else:
+                result = real_email_service.send_email(email_request)
+            
+            if result.ok:
+                response_data = {
+                    'message': f'Test email sent successfully to {test_data.to_email}',
+                    'to_email': str(test_data.to_email),
+                    'subject': subject,
+                    'message_id': result.message_id
+                }
+                if pdf_bytes:
+                    response_data['pdf_attached'] = True
+                    response_data['pdf_filename'] = pdf_filename
+                    response_data['pdf_size'] = len(pdf_bytes)
+                    if pdf_generation_method:
+                        response_data['pdf_generation_method'] = pdf_generation_method
+                else:
+                    response_data['pdf_attached'] = False
+                    if pdf_error_message:
+                        response_data['pdf_error'] = pdf_error_message
+                
+                return {
+                    'ok': True,
+                    'status': 200,
+                    'data': response_data
+                }
+            else:
+                return {
+                    'ok': False,
+                    'status': 500,
+                    'error': {
+                        'code': 'EMAIL_SEND_FAILED',
+                        'message': result.error or 'Failed to send test email'
+                    }
+                }
+                
+        except Exception as e:
+            logger.error(f"Error sending test email: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return {
+                'ok': False,
+                'status': 500,
+                'error': {
+                    'code': 'TEST_EMAIL_FAILED',
+                    'message': str(e)
+                }
+            }
+
+    async def _handle_upload_csv_admin_direct_email(self, csv_data: str):
+        import csv
+        from io import StringIO
+
+        f = StringIO(csv_data)
+        reader = csv.DictReader(f)
+
+        org_map = {}
+
+        for row in reader:
+            org = row.get("organization_website") or row.get("org") or "Unknown Organization"
+            student = {
+                "studentName": row.get("student_name") or row.get("name") or "",
+                "email": row.get("email") or "",
+                "password": row.get("password") or "",
+                "orgWebsite": org
+            }
+            org_map.setdefault(org, []).append(student)
+
+        org_sections = ""
+        for org, students in org_map.items():
+
+            rows_html = "".join(
+                f"""
+                <tr>
+                    <td style='border:1px solid #e5e7eb; padding:8px 10px; white-space:nowrap;'>{s['studentName']}</td>
+                    <td style='border:1px solid #e5e7eb; padding:8px 10px; white-space:nowrap;'>{s['email']}</td>
+                    <td style='border:1px solid #e5e7eb; padding:8px 10px; white-space:nowrap;'>{s['password']}</td>
+                    <td style='border:1px solid #e5e7eb; padding:8px 10px; white-space:nowrap;'>{s['orgWebsite']}</td>
+                </tr>
+                """ for s in students
+            )
+
+            org_sections += f"""
+                <div style="margin-top:24px; padding:18px; background:#fafafa; border:1px solid #e2e8f0; border-radius:6px;">
+                    <div style="font-size:16px; font-weight:bold; margin-bottom:8px;">
+                        Organization : {org}
+                    </div>
+    
+                    <p style="margin:0 0 10px 0;">
+                        Total Students: <strong>{len(students)}</strong>
+                    </p>
+    
+                    <div style="overflow-x:auto; width:100%;">
+                        <table style="width:100%; border-collapse:collapse; min-width:600px;">
+                            <thead>
+                                <tr>
+                                    <th style='background:#f1f5f9; border:1px solid #e5e7eb; padding:8px 10px; text-align:left;'>
+                                        Student Name
+                                    </th>
+                                    <th style='background:#f1f5f9; border:1px solid #e5e7eb; padding:8px 10px; text-align:left;'>
+                                        Email
+                                    </th>
+                                    <th style='background:#f1f5f9; border:1px solid #e5e7eb; padding:8px 10px; text-align:left;'>
+                                        Password
+                                    </th>
+                                    <th style='background:#f1f5f9; border:1px solid #e5e7eb; padding:8px 10px; text-align:left;'>
+                                        Org Website
+                                    </th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {rows_html}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            """
+
+        # ----------------------------
+        # Final HTML
+        # ----------------------------
+
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; background:#f6f7f9; margin:0; padding:0; color:#333;">
+            <div style="max-width:700px; margin:25px auto; background:#fff; padding:25px; border-radius:8px; border:1px solid #e5e7eb;">
+                
+                <h2 style="margin-top:0;">New Learner CSV Uploaded</h2>
+                <p>Hello Sharon,</p>
+                <p>The CSV has been uploaded successfully. Summary is below. The original file is attached.</p>
+    
+                {org_sections}
+    
+                <p style="margin-top:20px;">
+                    Thanks,<br>
+                    Sharon Decet Learning Platform
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+
+        emails = ["learningshopusalisa@gmail.com", "sharondecet@yahoo.com"]
+
+        real_email_service = RealEmailService(self.db.client)
+        from shared.models import EmailRequest
+
+        for email in emails:
+            email_request = EmailRequest(
+                to_email=email,
+                subject="Learner CSV Upload Summary",
+                body=html_body,
+                attachment_filename="learners_upload.csv"
+            )
+            real_email_service.send_email(email_request, attachment_content=csv_data.encode("utf-8"))
+
+
+
+
+    async def _send_org_wise_csv_summary_emails(self, validation_result: CSVValidationResult):
+        from shared.models import EmailRequest
+        real_email_service = RealEmailService(self.db.client)
+
+        unique_orgs = sorted({row.organization_website for row in validation_result.valid_rows})
+        orgs = self.db.get_organizations_by_websites(unique_orgs)
+        org_map = {o.website: o for o in orgs}
+
+        learners_by_org = {}
+        for row in validation_result.valid_rows:
+            learners_by_org.setdefault(row.organization_website, []).append(row)
+
+        for website, learners in learners_by_org.items():
+            org = org_map.get(website)
+            if not org:
+                logger.warning(f"No organization found in DB for website: {website}")
+                continue
+
+            sop_email = getattr(org, "sop_email", None)
+            if not sop_email:
+                logger.warning(f"Organization '{website}' does not have sop_email configured.")
+                continue
+
+            rows_html = "".join(
+                f"<tr><td>{l.name}</td><td>{l.email}</td><td>{l.password}</td></tr>"
+                for l in learners
+            )
+
+            html_body = f"""
+            <html>
+            <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; color: #333; }}
+                table {{ border-collapse: collapse; width: 100%; margin-top: 14px; }}
+                th, td {{ border: 1px solid #e5e7eb; padding: 8px; text-align: left; }}
+                th {{ background: #f1f5f9; }}
+            </style>
+            </head>
+            <body>
+                <h3>Learners Uploaded for {website}</h3>
+                <p>Total Learners: <strong>{len(learners)}</strong></p>
+                <table>
+                    <thead>
+                        <tr><th>Name</th><th>Email</th><th>Password</th></tr>
+                    </thead>
+                    <tbody>
+                        {rows_html}
+                    </tbody>
+                </table>
+                <br>
+                <p>Regards,<br>Sharon Decet Learning Platform</p>
+            </body>
+            </html>
+            """
+
+            email_request = EmailRequest(
+                to_email=sop_email,
+                subject=f"Learners Added for {website}",
+                body=html_body
+            )
+
+            real_email_service.send_email(email_request)
+            logger.info(f"Sent upload summary to {sop_email} for {website}")
 
     def _handle_resend_certificate(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
         """Handle RESEND_CERTIFICATE action (SOP-initiated)."""
@@ -2701,42 +3437,42 @@ class AdminRouter:
             stats_data = LearnerStatisticsPayload(**payload)
             
             # Get all learners across all organizations
-            organizations, _ = self.db.list_organizations(limit=1000, offset=0)
-            all_learners = []
-            
-            for org in organizations:
-                org_learners = self.db.query_learners_for_org(org.website, limit=10000, offset=0)
-                all_learners.extend(org_learners)
-            
-            # Calculate metrics
-            total_learners = len(set(learner.email for learner in all_learners))  # Unique learners
-            total_enrollments = len(all_learners)  # Total course enrollments
-            
-            # Active learners (currently enrolled or in progress)
-            active_learners = len(set(
-                learner.email for learner in all_learners 
-                if getattr(learner, 'enrollment_status', 'pending') in ['enrolled', 'in_progress']
-            ))
-            
-            # Completion rate (average completion percentage)
-            completion_percentages = [
-                getattr(learner, 'completion_percentage', 0) 
-                for learner in all_learners 
-                if getattr(learner, 'completion_percentage', 0) is not None
-            ]
-            avg_completion_rate = round(
-                sum(completion_percentages) / len(completion_percentages) if completion_percentages else 0, 
-                1
-            )
+            # organizations, _ = self.db.list_organizations(limit=1000, offset=0)
+            # all_learners = []
+            #
+            # for org in organizations:
+            #     org_learners = self.db.query_learners_for_org(org.website, limit=10000, offset=0)
+            #     all_learners.extend(org_learners)
+            #
+            # # Calculate metrics
+            # total_learners = len(set(learner.email for learner in all_learners))  # Unique learners
+            # total_enrollments = len(all_learners)  # Total course enrollments
+            #
+            # # Active learners (currently enrolled or in progress)
+            # active_learners = len(set(
+            #     learner.email for learner in all_learners
+            #     if getattr(learner, 'enrollment_status', 'pending') in ['enrolled', 'in_progress']
+            # ))
+            #
+            # # Completion rate (average completion percentage)
+            # completion_percentages = [
+            #     getattr(learner, 'completion_percentage', 0)
+            #     for learner in all_learners
+            #     if getattr(learner, 'completion_percentage', 0) is not None
+            # ]
+            # avg_completion_rate = round(
+            #     sum(completion_percentages) / len(completion_percentages) if completion_percentages else 0,
+            #     1
+            # )
             
             return {
                 'ok': True,
                 'status': 200,
                 'data': {
-                    'total_learners': total_learners,
-                    'active_learners': active_learners,
-                    'total_enrollments': total_enrollments,
-                    'completion_rate': avg_completion_rate
+                    'total_learners': 0,
+                    'active_learners': 0,
+                    'total_enrollments': 0,
+                    'completion_rate': 0
                 }
             }
             

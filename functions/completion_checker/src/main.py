@@ -140,7 +140,7 @@ class CompletionChecker:
                 database_id='main',
                 collection_id='learners',
                 queries=[
-                    Query.equal('enrollment_status', 'enrolled'),
+                    Query.equal('enrollment_status', ['enrolled', 'pending']),
                     Query.not_equal('course_id', ''),
                     Query.limit(limit),
                     Query.offset(offset)
@@ -546,7 +546,7 @@ def main(context):
 
         
         if action == 'health' or action == 'process_batch':
-            batch_size = request_data.get('batch_size', 50)
+            batch_size = request_data.get('batch_size', 1000)
             context.log(f"Executing process_batch with batch_size: {batch_size}")
             result = checker.process_batch(batch_size)
             context.log(f"Process batch result: {result}")

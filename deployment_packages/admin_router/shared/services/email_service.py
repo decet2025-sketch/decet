@@ -37,15 +37,22 @@ class EmailService:
         
         logger.info("Email service initialized with Appwrite HTTP API")
         
-        # Gmail SMTP configuration (from Appwrite console)
+        # Gmail SMTP configuration (from environment variables)
+        # If not set, fall back to defaults (for backward compatibility)
+        gmail_username = os.getenv('GMAIL_USERNAME', 'decet2025@gmail.com')
+        gmail_password = os.getenv('GMAIL_APP_PASSWORD', 'qfzq tnqq nuov oofe')
+        gmail_from = os.getenv('GMAIL_FROM_EMAIL', gmail_username)
+
         self.smtp_config = {
-            'host': 'smtp.gmail.com',
-            'port': 587,
-            'username': 'decet2025@gmail.com',
-            'password': 'szwk lgbw xkhh kocj',  # Gmail app password from Appwrite console
-            'use_tls': True,
-            'from_email': 'decet2025@gmail.com'
+            'host': os.getenv('SMTP_HOST', 'smtp.gmail.com'),
+            'port': int(os.getenv('SMTP_PORT', '587')),
+            'username': gmail_username,
+            'password': gmail_password,
+            'use_tls': os.getenv('SMTP_USE_TLS', 'true').lower() == 'true',
+            'from_email': gmail_from
         }
+
+        logger.info(f"SMTP configured for: {self.smtp_config['username']} (host: {self.smtp_config['host']})")
 
     def send_email(self, request: EmailRequest, attachment_content: Optional[bytes] = None) -> EmailResponse:
         """Send email using Appwrite's messaging service."""

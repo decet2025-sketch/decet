@@ -343,7 +343,11 @@ class CertificateWorker:
             context = CertificateContext(
                 learner_name=learner.name,
                 course_name=course.name,
-                completion_date=learner.completion_date.isoformat().replace('+00:00', 'Z') if learner.completion_date else datetime.utcnow().isoformat().replace('+00:00', 'Z'),
+                completion_date=(
+                    learner.completion_date.date().isoformat()
+                    if learner.completion_date
+                    else datetime.utcnow().date().isoformat()
+                ),
                 organization=org.name or org.website,
                 learner_email=learner.email
             )

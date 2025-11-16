@@ -227,6 +227,24 @@ class AppwriteClient:
             logger.error(f"Error getting organization {website}: {e}")
             return None
 
+    def get_organizations_by_websites(self, websites: list[str]) -> list[OrganizationModel]:
+        """Get multiple organizations by list of websites."""
+        try:
+            result = self.databases.list_documents(
+                database_id='main',
+                collection_id='organizations',
+                queries=[Query.equal('website', websites)]
+            )
+
+            return [
+                self._convert_document_to_model(doc, OrganizationModel)
+                for doc in result.get('documents', [])
+            ]
+        except Exception as e:
+            logger.error(f"Error fetching organizations for websites {websites}: {e}")
+            return []
+
+
     def get_all_organization_by_website(self, website: str) -> List[OrganizationModel]:
         """Get organization by website."""
         try:
@@ -340,6 +358,49 @@ class AppwriteClient:
         except Exception as e:
             logger.error(f"Error updating organization by ID {organization_id}: {e}")
             return None
+
+    def update_organizations_password_by_sop_email(
+        self,
+        sop_email: str,
+        new_password: str,
+        organization_website: Optional[str] = None
+    ) -> int:
+        """Update password field for organizations matching the SOP email (and optional website)."""
+        try:
+            queries = [Query.equal('sop_email', sop_email)]
+            if organization_website:
+                queries.append(Query.equal('website', organization_website))
+
+            result = self.databases.list_documents(
+                database_id='main',
+                collection_id='organizations',
+                queries=queries
+            )
+
+            updated_count = 0
+            timestamp = datetime.utcnow().isoformat() + 'Z'
+
+            for document in result.get('documents', []):
+                try:
+                    self.databases.update_document(
+                        database_id='main',
+                        collection_id='organizations',
+                        document_id=document['$id'],
+                        data={
+                            'password': new_password,
+                            'updated_at': timestamp
+                        }
+                    )
+                    updated_count += 1
+                except Exception as update_error:
+                    logger.error(
+                        f"Failed to update organization password for {sop_email} (document {document.get('$id')}): {update_error}"
+                    )
+
+            return updated_count
+        except Exception as e:
+            logger.error(f"Error updating organization password for {sop_email}: {e}")
+            return 0
 
     def delete_organization(self, website: str) -> bool:
         """Delete organization by website."""
