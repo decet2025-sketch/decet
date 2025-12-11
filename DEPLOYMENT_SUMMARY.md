@@ -140,3 +140,5 @@ You now have a **fully functional, production-ready Certificate Management Syste
 
 **Your system is ready for production use!** 🚀
 
+## Deploy command
+cd /Users/akulgupta/Desktop/sample/decet && ./deploy_production.sh admin_router && curl -s -X POST "https://cloud.appwrite.io/v1/functions/admin_router/deployments" -H "Content-Type: multipart/form-data" -H "X-Appwrite-Project: 68cf04e30030d4b38d19" -H "X-Appwrite-Key: standard_433c1d266b99746da7293cecabc52ca95bb22210e821cfd4292da0a8eadb137d36963b60dd3ecf89f7cf0461a67046c676ceacb273c60dbc1a19da1bc9042cc82e7653cb167498d8504c6abbda8634393289c3335a0cb72eb8d7972249a0b22a10f9195b0d43243116b54f34f7a15ad837a900922e23bcba34c80c5c09635142" -F "entrypoint=main.py" -F "code=@deployment_packages/admin_router.tar.gz" -F "activate=true"

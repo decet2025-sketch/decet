@@ -176,6 +176,7 @@ class ListAllLearnersPayload(BaseModel):
     offset: int = Field(0, ge=0)
     organization_website: Optional[str] = Field(None, max_length=255)
     course_id: Optional[str] = Field(None, max_length=255)
+    enrollment_status: Optional[str] = Field(None, max_length=255)
     search: Optional[str] = Field(None, max_length=255)
 
 
@@ -198,7 +199,7 @@ class EditOrganizationPayload(BaseModel):
 
 class ListOrganizationsPayload(BaseModel):
     """Payload for listing organizations."""
-    limit: int = Field(50, ge=1, le=100)
+    limit: int = Field(50, ge=1, le=3000)
     offset: int = Field(0, ge=0)
     search: Optional[str] = Field(None, max_length=255)
 

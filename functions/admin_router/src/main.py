@@ -917,8 +917,10 @@ class AdminRouter:
             context.log(f"Upload result - Created: {upload_result.created_learners}, Enrolled: {upload_result.enrollment_success}, Failed: {upload_result.enrollment_failed}")
 
             try:
-                self._handle_upload_csv_admin_direct_email(upload_data.csv_data)
-                self._send_org_wise_csv_summary_emails(validation_result)
+                context.log(f"Processing emails for admins: {upload_data.course_id}")
+                self._handle_upload_csv_admin_direct_email(upload_data.csv_data, context)
+                context.log(f"Processing emails for pocs: {upload_data.course_id}")
+                self._send_org_wise_csv_summary_emails(validation_result, context)
             except Exception as e:
                 logger.warning(f"Email Processing error on learner upload: {str(e)}")
             
@@ -1206,6 +1208,17 @@ class AdminRouter:
                                 'enrollment_status': 'enrolled'
                             })
                             context.log(f"Database updated successfully for {learner_row.email}")
+                            try:
+                                context.log(f"Sending enrollment success email to {learner_row.email}")
+                                self._send_learners_org_wise_csv_summary_emails(
+                                    learner_row.email,
+                                    learner_row.name,
+                                    learner_row.password,
+                                    course_id
+                                )
+                                context.log(f"Enrollment success email sent to {learner_row.email}")
+                            except Exception as email_error:
+                                context.log(f"Failed to send enrollment email to {learner_row.email}: {email_error}")
                         except Exception as update_error:
                             context.log(f"Failed to update learner enrollment status: {update_error}")
                         enrollment_success += 1
@@ -1391,12 +1404,12 @@ class AdminRouter:
             }
 
     def _handle_download_all_learners_csv(self, payload: Dict[str, Any], auth_context):
-        """Generate CSV with basic learner info and return as base64 for download."""
+        """Generate grouped CSV: one row per learner with dynamic course columns."""
         try:
             from appwrite.query import Query
-            import csv, io, base64
+            import csv, io, base64, json
 
-            # Query learners
+            # Step 1 — Fetch learners
             queries = [Query.limit(3000), Query.offset(0), Query.order_desc("$updatedAt")]
             result = self.db.databases.list_documents(
                 database_id="main",
@@ -1404,43 +1417,101 @@ class AdminRouter:
                 queries=queries
             )
 
+            raw_docs = result["documents"]
+
+            # Step 2 — Convert to models
             learners = [
                 self.db._convert_document_to_model(doc, LearnerModel)
-                for doc in result["documents"]
+                for doc in raw_docs
             ]
 
-            # Basic CSV fields
-            fields = [
-                "id",
-                "name",
-                "email",
-                "organization_website",
-                "course_id",
-                "enrolled_at",
-            ]
+            # Load course map
+            course_map = {}
+            try:
+                course_result = self.db.databases.list_documents(
+                    database_id="main",
+                    collection_id="courses"
+                )
+                for c in course_result["documents"]:
+                    course_obj = self.db._convert_document_to_model(c, CourseModel)
+                    course_map[course_obj.course_id] = course_obj
+            except Exception as e:
+                logger.warning(f"Failed to batch load courses: {e}")
 
-            buf = io.StringIO()
-            writer = csv.DictWriter(buf, fieldnames=fields)
-            writer.writeheader()
-
+            # Step 3 — Group learners by ID
+            grouped = {}
             for l in learners:
-                writer.writerow({
-                    "id": l.id,
-                    "name": l.name,
-                    "email": l.email,
-                    "organization_website": l.organization_website,
-                    "course_id": l.course_id,
-                    "enrolled_at": l.enrolled_at.isoformat() if l.enrolled_at else "",
+                if l.id not in grouped:
+                    grouped[l.id] = {
+                        "id": l.id,
+                        "name": l.name,
+                        "email": l.email,
+                        "organization_website": l.organization_website,
+                        "courses": []
+                    }
+
+                # Parse completion_data safely
+                progress = ""
+                try:
+                    if isinstance(l.completion_data, str):
+                        cd = json.loads(l.completion_data)
+                    else:
+                        cd = l.completion_data or {}
+                    progress = cd.get("progress", "")
+                except Exception:
+                    progress = ""
+
+                # Get course name
+                if l.course_id in course_map:
+                    course_obj = course_map[l.course_id]
+                    course_name = getattr(course_obj, "name", l.course_id)
+                else:
+                    course_name = l.course_id  # fallback
+
+                grouped[l.id]["courses"].append({
+                    "course_name": course_name,
+                    "completion": progress
                 })
 
-            # Encode to base64
+            # Step 4 — Determine max number of courses
+            max_courses = max(len(v["courses"]) for v in grouped.values()) if grouped else 0
+
+            # Step 5 — CSV columns
+            base_fields = ["id", "name", "email", "organization_website"]
+            dynamic_fields = []
+            for i in range(1, max_courses + 1):
+                dynamic_fields.append(f"course{i}")
+                dynamic_fields.append(f"completionPercentage{i}")
+
+            csv_fields = base_fields + dynamic_fields
+
+            # Step 6 — Write CSV
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=csv_fields)
+            writer.writeheader()
+
+            for learner_id, data in grouped.items():
+                row = {
+                    "id": data["id"],
+                    "name": data["name"],
+                    "email": data["email"],
+                    "organization_website": data["organization_website"]
+                }
+
+                for idx, course in enumerate(data["courses"], start=1):
+                    row[f"course{idx}"] = course["course_name"]
+                    row[f"completionPercentage{idx}"] = course["completion"]
+
+                writer.writerow(row)
+
+            # Step 7 — Encode base64
             csv_bytes = buf.getvalue().encode("utf-8")
             csv_b64 = base64.b64encode(csv_bytes).decode()
 
             return {
                 "ok": True,
                 "status": 200,
-                "filename": "learners.csv",
+                "filename": "grouped_learners.csv",
                 "mime": "text/csv",
                 "data_base64": csv_b64,
             }
@@ -1452,6 +1523,7 @@ class AdminRouter:
                 "status": 400,
                 "error": {"code": "CSV_ERROR", "message": str(e)},
             }
+
 
     def _handle_list_all_learners(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
         """Simplified version of LIST_ALL_LEARNERS with datetime-safe serialization."""
@@ -1511,11 +1583,14 @@ class AdminRouter:
         try:
             from appwrite.query import Query
 
-            queries = [Query.limit(1000), Query.offset(0), Query.order_desc("$updatedAt")]
+            queries = [Query.limit(3000), Query.offset(0), Query.order_desc("$updatedAt")]
 
             # Apply filters
             if params.organization_website:
+                # queries.append(Query.equal("organization_website", params.organization_website))
                 queries.append(Query.equal("organization_website", params.organization_website))
+            if params.enrollment_status:
+                queries.append(Query.equal("enrollment_status", params.enrollment_status))
             if params.course_id:
                 queries.append(Query.equal("course_id", params.course_id))
 
@@ -2764,117 +2839,123 @@ class AdminRouter:
                 }
             }
 
-    async def _handle_upload_csv_admin_direct_email(self, csv_data: str):
-        import csv
-        from io import StringIO
+    def _handle_upload_csv_admin_direct_email(self, csv_data: str, context):
+        try:
+            import csv
+            from io import StringIO
 
-        f = StringIO(csv_data)
-        reader = csv.DictReader(f)
+            f = StringIO(csv_data)
+            reader = csv.DictReader(f)
 
-        org_map = {}
+            org_map = {}
 
-        for row in reader:
-            org = row.get("organization_website") or row.get("org") or "Unknown Organization"
-            student = {
-                "studentName": row.get("student_name") or row.get("name") or "",
-                "email": row.get("email") or "",
-                "password": row.get("password") or "",
-                "orgWebsite": org
-            }
-            org_map.setdefault(org, []).append(student)
+            for row in reader:
+                org = row.get("organization_website") or row.get("org") or "Unknown Organization"
+                student = {
+                    "studentName": row.get("student_name") or row.get("name") or "",
+                    "email": row.get("email") or "",
+                    "password": row.get("password") or "",
+                    "orgWebsite": org
+                }
+                org_map.setdefault(org, []).append(student)
 
-        org_sections = ""
-        for org, students in org_map.items():
+            org_sections = ""
+            for org, students in org_map.items():
 
-            rows_html = "".join(
-                f"""
-                <tr>
-                    <td style='border:1px solid #e5e7eb; padding:8px 10px; white-space:nowrap;'>{s['studentName']}</td>
-                    <td style='border:1px solid #e5e7eb; padding:8px 10px; white-space:nowrap;'>{s['email']}</td>
-                    <td style='border:1px solid #e5e7eb; padding:8px 10px; white-space:nowrap;'>{s['password']}</td>
-                    <td style='border:1px solid #e5e7eb; padding:8px 10px; white-space:nowrap;'>{s['orgWebsite']}</td>
-                </tr>
-                """ for s in students
-            )
+                rows_html = "".join(
+                    f"""
+                    <tr>
+                        <td style='border:1px solid #e5e7eb; padding:8px 10px; white-space:nowrap;'>{s['studentName']}</td>
+                        <td style='border:1px solid #e5e7eb; padding:8px 10px; white-space:nowrap;'>{s['email']}</td>
+                        <td style='border:1px solid #e5e7eb; padding:8px 10px; white-space:nowrap;'>{s['password']}</td>
+                        <td style='border:1px solid #e5e7eb; padding:8px 10px; white-space:nowrap;'>{s['orgWebsite']}</td>
+                    </tr>
+                    """ for s in students
+                )
 
-            org_sections += f"""
-                <div style="margin-top:24px; padding:18px; background:#fafafa; border:1px solid #e2e8f0; border-radius:6px;">
-                    <div style="font-size:16px; font-weight:bold; margin-bottom:8px;">
-                        Organization : {org}
+                org_sections += f"""
+                    <div style="margin-top:24px; padding:18px; background:#fafafa; border:1px solid #e2e8f0; border-radius:6px;">
+                        <div style="font-size:16px; font-weight:bold; margin-bottom:8px;">
+                            Organization : {org}
+                        </div>
+        
+                        <p style="margin:0 0 10px 0;">
+                            Total Students: <strong>{len(students)}</strong>
+                        </p>
+        
+                        <div style="overflow-x:auto; width:100%;">
+                            <table style="width:100%; border-collapse:collapse; min-width:600px;">
+                                <thead>
+                                    <tr>
+                                        <th style='background:#f1f5f9; border:1px solid #e5e7eb; padding:8px 10px; text-align:left;'>
+                                            Student Name
+                                        </th>
+                                        <th style='background:#f1f5f9; border:1px solid #e5e7eb; padding:8px 10px; text-align:left;'>
+                                            Email
+                                        </th>
+                                        <th style='background:#f1f5f9; border:1px solid #e5e7eb; padding:8px 10px; text-align:left;'>
+                                            Password
+                                        </th>
+                                        <th style='background:#f1f5f9; border:1px solid #e5e7eb; padding:8px 10px; text-align:left;'>
+                                            Org Website
+                                        </th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {rows_html}
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
-    
-                    <p style="margin:0 0 10px 0;">
-                        Total Students: <strong>{len(students)}</strong>
+                """
+
+            # ----------------------------
+            # Final HTML
+            # ----------------------------
+
+            html_body = f"""
+            <html>
+            <body style="font-family: Arial, sans-serif; background:#f6f7f9; margin:0; padding:0; color:#333;">
+                <div style="max-width:700px; margin:25px auto; background:#fff; padding:25px; border-radius:8px; border:1px solid #e5e7eb;">
+                    
+                    <h2 style="margin-top:0;">New Learner CSV Uploaded</h2>
+                    <p>Hello Sharon,</p>
+                    <p>The learner CSV has been uploaded successfully. A full summary is included below, and the original file is attached for your reference.</p>
+                    <p>Students can access their course by signing in with the credentials listed below at:<br>
+                    <strong>https://www.learningshopusa.online</strong>
                     </p>
-    
-                    <div style="overflow-x:auto; width:100%;">
-                        <table style="width:100%; border-collapse:collapse; min-width:600px;">
-                            <thead>
-                                <tr>
-                                    <th style='background:#f1f5f9; border:1px solid #e5e7eb; padding:8px 10px; text-align:left;'>
-                                        Student Name
-                                    </th>
-                                    <th style='background:#f1f5f9; border:1px solid #e5e7eb; padding:8px 10px; text-align:left;'>
-                                        Email
-                                    </th>
-                                    <th style='background:#f1f5f9; border:1px solid #e5e7eb; padding:8px 10px; text-align:left;'>
-                                        Password
-                                    </th>
-                                    <th style='background:#f1f5f9; border:1px solid #e5e7eb; padding:8px 10px; text-align:left;'>
-                                        Org Website
-                                    </th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {rows_html}
-                            </tbody>
-                        </table>
-                    </div>
+
+        
+                    {org_sections}
+        
+                    <p style="margin-top:20px;">
+                        Thanks,<br>
+                        Sharon Decet Learning Platform
+                    </p>
                 </div>
+            </body>
+            </html>
             """
 
-        # ----------------------------
-        # Final HTML
-        # ----------------------------
+            emails = ["learningshopusalisa@gmail.com", "sharondecet@yahoo.com"]
 
-        html_body = f"""
-        <html>
-        <body style="font-family: Arial, sans-serif; background:#f6f7f9; margin:0; padding:0; color:#333;">
-            <div style="max-width:700px; margin:25px auto; background:#fff; padding:25px; border-radius:8px; border:1px solid #e5e7eb;">
-                
-                <h2 style="margin-top:0;">New Learner CSV Uploaded</h2>
-                <p>Hello Sharon,</p>
-                <p>The CSV has been uploaded successfully. Summary is below. The original file is attached.</p>
-    
-                {org_sections}
-    
-                <p style="margin-top:20px;">
-                    Thanks,<br>
-                    Sharon Decet Learning Platform
-                </p>
-            </div>
-        </body>
-        </html>
-        """
-
-        emails = ["learningshopusalisa@gmail.com", "sharondecet@yahoo.com"]
-
-        real_email_service = RealEmailService(self.db.client)
-        from shared.models import EmailRequest
-
-        for email in emails:
-            email_request = EmailRequest(
-                to_email=email,
-                subject="Learner CSV Upload Summary",
-                body=html_body,
-                attachment_filename="learners_upload.csv"
-            )
-            real_email_service.send_email(email_request, attachment_content=csv_data.encode("utf-8"))
+            real_email_service = RealEmailService(self.db.client)
+            from shared.models import EmailRequest
+            for email in emails:
+                context.log("sending learner upload email to : " + email)
+                email_request = EmailRequest(
+                    to_email=email,
+                    subject="Learner CSV Upload Summary",
+                    body=html_body,
+                    attachment_filename="learners_upload.csv"
+                )
+                real_email_service.send_email(email_request, attachment_content=csv_data.encode("utf-8"))
+        except Exception as e:
+            context.log("could not send email : " + str(e))
 
 
 
-
-    async def _send_org_wise_csv_summary_emails(self, validation_result: CSVValidationResult):
+    def _send_org_wise_csv_summary_emails(self, validation_result: CSVValidationResult, context):
         from shared.models import EmailRequest
         real_email_service = RealEmailService(self.db.client)
 
@@ -2913,7 +2994,11 @@ class AdminRouter:
             </style>
             </head>
             <body>
-                <h3>Learners Uploaded for {website}</h3>
+            <p>The learner CSV for {website} has been uploaded successfully. A full summary is included below, and 
+            the original file is attached for your reference.</p>
+                <p>Students can access their course by signing in with the credentials listed below at:<br>
+                <strong>https://www.learningshopusa.online</strong>
+            </p>
                 <p>Total Learners: <strong>{len(learners)}</strong></p>
                 <table>
                     <thead>
@@ -2937,6 +3022,75 @@ class AdminRouter:
 
             real_email_service.send_email(email_request)
             logger.info(f"Sent upload summary to {sop_email} for {website}")
+
+
+    def _send_learners_org_wise_csv_summary_emails(self, learner_email, learner_name, password, course_id):
+        from shared.models import EmailRequest
+        real_email_service = RealEmailService(self.db.client)
+
+        course = self.db.get_course_by_course_id(course_id)
+        course_name = course.name
+
+        html_body = f"""
+            <html>
+            <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; color: #333; }}
+                table {{ border-collapse: collapse; width: 100%; margin-top: 14px; }}
+                th, td {{ border: 1px solid #e5e7eb; padding: 8px; text-align: left; }}
+                th {{ background: #f1f5f9; }}
+            </style>
+            </head>
+            <body>
+            
+            <p>Hi {learner_name},</p>
+            
+            <p>Your details have been successfully uploaded to our system.  
+            You can access your course <strong>{course_name}</strong> using the credentials below at:<br>
+            <strong>https://www.learningshopusa.online</strong></p>
+            
+            <p><strong>Important Instructions:</strong><br>
+            As you are taking the course—reading a page or watching a video—please click  
+            <strong>CONTINUE</strong> and <strong>COMPLETE</strong> to progress through the lessons.<br><br>
+            To avoid video issues:<br>
+            • Turn off your VPN.<br>
+            • If your internet provider has strict security filters, try switching to your phone/mobile data.<br>
+            </p>
+            
+            <table>
+                <thead>
+                    <tr><th>Name</th><th>Email</th><th>Password</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>{learner_name}</td>
+                        <td>{learner_email}</td>
+                        <td>{password}</td>
+                    </tr>
+                </tbody>
+            </table>
+            
+            <br>
+            
+            <p>Thank you! Please feel free to contact us if you have any questions.</p>
+            
+            <p>Regards,<br>
+            Sharon Decet Learning Platform</p>
+            
+            </body>
+            </html>
+            """
+
+
+
+        email_request = EmailRequest(
+            to_email=learner_email,
+            subject=f"You're enrolled in {course_name}",
+            body=html_body
+        )
+
+        real_email_service.send_email(email_request)
+
 
     def _handle_resend_certificate(self, payload: Dict[str, Any], auth_context) -> Dict[str, Any]:
         """Handle RESEND_CERTIFICATE action (SOP-initiated)."""

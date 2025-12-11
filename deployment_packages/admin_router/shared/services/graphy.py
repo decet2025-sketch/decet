@@ -318,7 +318,7 @@ class GraphyService:
                 'GET',
                 '/public/v2/learners',
                 {
-                    'query': json.dumps({'email': email}),  # JSON-encode the query
+                    'query': json.dumps({'email': email.lower()}),  # JSON-encode the query
                     'courseInfo': 'true',  # Include course information
                     'limit': 1  # We only need one result
                 }

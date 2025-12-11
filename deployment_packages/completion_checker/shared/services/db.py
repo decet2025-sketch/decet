@@ -173,7 +173,7 @@ class AppwriteClient:
             return [], 0
 
     # Organization operations
-    def list_organizations(self, limit: int = 100, offset: int = 0, search: str = None) -> tuple[List[OrganizationModel], int]:
+    def list_organizations(self, limit: int = 3000, offset: int = 0, search: str = None) -> tuple[List[OrganizationModel], int]:
         """List all organizations with pagination and search."""
         try:
             # Build filter queries for both count and data queries

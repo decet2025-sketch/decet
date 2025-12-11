@@ -364,7 +364,9 @@ class CertificateRenderer:
             api_url = "https://api.pdfendpoint.com/v1/convert"
             api_tokens = [
                 "pdfe_live_302b2ea1dbb69eda24f127988523a36a0a4d",
-                "pdfe_live_caf821c185031e38be28a9479aff57b22471"
+                "pdfe_live_caf821c185031e38be28a9479aff57b22471",
+                "pdfe_live_c249d6190e000d6e3d2da7c84f44f136ee7a",
+                "pdfe_live_8c47e634349a3b9e59185d17b5c3d4459fa9"
             ]
             
             # Prepare payload
