@@ -40,7 +40,7 @@ class EmailService:
         # Gmail SMTP configuration (from environment variables)
         # If not set, fall back to defaults (for backward compatibility)
         gmail_username = os.getenv('GMAIL_USERNAME', 'decet2025@gmail.com')
-        gmail_password = os.getenv('GMAIL_APP_PASSWORD', 'qfzq tnqq nuov oofe')
+        gmail_password = os.getenv('GMAIL_APP_PASSWORD', 'yosamwzywwahzqbk')
         gmail_from = os.getenv('GMAIL_FROM_EMAIL', gmail_username)
 
         self.smtp_config = {
